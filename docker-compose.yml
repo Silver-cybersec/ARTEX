@@ -1,6 +1,7 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # 2026-11-16 从 Docker Hub 读到的多架构索引。amd64 注解版本为 16.16-alpine3.24。
+    image: postgres:16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-artex}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 设置 POSTGRES_PASSWORD}
