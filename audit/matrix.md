@@ -1,6 +1,6 @@
 # 验收矩阵（RuoJi6/ARTEX @ 253a8eeac3b278cd4ff383674a31a0edcc34e143）
 
-阅读时间：2026-11-26 09:37 香港时间（UTC+8）。未做动态验证。用户已定的 R1–R7 保留；其后为执行中补行。
+阅读时间：2026-11-26 09:37 香港时间（UTC+8）完成 R1–R7。2026-11-26 10:14 香港时间起追加 R8、R9，对照完成于同日 10:15 香港时间之后。未做动态验证。用户已定的 R1–R7 保留；其后为执行中补行。
 
 | ID | 需求 | 检查项 | 证据 | 结论 | 未覆盖 |
 |---|---|---|---|---|---|
@@ -17,3 +17,5 @@
 | R4a | 供应链补行：norma | 版本是否固定；代理与 tag 是否一致；OSV | `go.mod` 第 6 行；proxy.golang.org v0.4.3.info；GitHub tag v0.4.3 → `320ae32989da97dd91469bb89164cbfe87d83d5d` | 版本固定且与公开 tag 一致。OSV 未命中。源码未审 | 未读 norma 树 |
 | R4b | 供应链补行：Next.js 通告 | 锁版本与生产形态是否同一类运行时 | `web/package-lock.json` 中 next@16.2.9；`web/next.config.mjs` 第 21–24 行静态导出 | 通告命中。发布路径是静态文件由 Go 提供，与通告中的 Next 服务器前提可能不一致 | 未逐条核对通告影响配置，未运行 `next start` |
 | R6a | 旧基准补行：依赖版本变化 | crypto/net/mitmproxy 是否升级以及通告是否还在 | `git diff a05a886d 253a8eea -- go.mod` | 有升级。`x/net` v0.61.0 仍命中 GO-2026-6860、GO-2026-6866 | 未做 `go list -m all`，旧 `go.sum` 行是否进入构建未确认 |
+| R8 | 功能与使用（2026-11-26 10:14 香港时间追加） | README／docs 宣称对照实现；安装后的命令、配置默认值、一条工作流。每条标未实测 | `audit/RERUN-20261126.md` 第 8 章。入口：`install.sh`、`start.sh`、`cmd/artex/main.go` 第 55–57 行、`/setup`、`agent/provider.go`、`server/mcp_server_tools.go` | 主路径能在源码中找到。不符：开发端口写成 5173 但 `next dev` 未指定端口。部分：Gemini、代理默认地址、数据库示例端口、备份是否含旧 `jwt.key` | 未运行。`docs/漏洞流量证据.md` 未逐项对照。norma 工具循环未读。归并与覆盖图交互未逐屏核对 |
+| R9 | 编译与部署要求（同次追加） | Dockerfile／compose／Makefile／包管理器；语言、数据库、外部服务版本；硬件；外网；文档不符。每条标未实测 | `audit/RERUN-20261126.md` 第 9 章。`build.sh` 第 33–49 行，`go.mod` 第 3 行，`release.yml` 第 58、88、142、206 行，`docker-compose.yml` 第 3、18 行 | 无 Makefile。Go 1.26.10，CI 的 Node 为 22，Compose 的 Postgres 为 16-alpine。文档无 GPU／内存下限。不能称为已验证可部署 | 未执行编译、npm ci、compose 或容器。arm64 镜像只看到工作流文本。磁盘与内存占用未测。`Dockerfile.bench` 不在本树 |
