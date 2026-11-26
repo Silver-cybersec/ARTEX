@@ -1,0 +1,196 @@
+{
+  "upstream": "https://github.com/RuoJi6/ARTEX",
+  "default_branch": "main",
+  "commit_sha": "253a8eeac3b278cd4ff383674a31a0edcc34e143",
+  "commit_time_hkt": "2026-11-23 18:44",
+  "commit_time_utc": "2026-11-23T10:44:27Z",
+  "audited_at_hkt": "2026-11-26 09:37",
+  "dynamic_verification": false,
+  "counts_confirmed": { "高": 2, "中": 5, "低": 2 },
+  "counts_unconfirmed": 1,
+  "findings": [
+    {
+      "id": "F-01",
+      "级别": "高",
+      "类别": "代码安全",
+      "路径": "cmd/artex/main.go",
+      "行号": 55,
+      "commit_sha": "253a8eeac3b278cd4ff383674a31a0edcc34e143",
+      "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/cmd/artex/main.go#L55",
+      "确认状态": "已确认",
+      "描述": "默认 HTTP 地址是 :8787，监听所有网卡。Compose 将 8787 发布到宿主所有网卡。首次 POST /api/auth/init 在口令尚未设置时不校验令牌，接受调用者给出的口令并返回 7 天管理员 JWT。数据库故障不会再被当成未设密。设密之前，能访问该端口的一方可以成为管理员。",
+      "建议": "默认只绑回环；Compose 的 8787 也绑到 127.0.0.1。在口令写入之前不要对非回环地址提供初始化接口，或要求一次性本地引导秘密。",
+      "位置": [
+        {"路径": "cmd/artex/main.go", "行号": 55, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/cmd/artex/main.go#L55"},
+        {"路径": "docker-compose.yml", "行号": 33, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/docker-compose.yml#L33"},
+        {"路径": "Dockerfile", "行号": 47, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/Dockerfile#L47"},
+        {"路径": "server/auth.go", "行号": 123, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/server/auth.go#L123"},
+        {"路径": "server/auth.go", "行号": 157, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/server/auth.go#L157"},
+        {"路径": "server/server.go", "行号": 801, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/server/server.go#L801"}
+      ],
+      "旧结论": "仍成立"
+    },
+    {
+      "id": "F-02",
+      "级别": "高",
+      "类别": "代码安全",
+      "路径": "guard/guard.go",
+      "行号": 92,
+      "commit_sha": "253a8eeac3b278cd4ff383674a31a0edcc34e143",
+      "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/guard/guard.go#L92",
+      "确认状态": "已确认",
+      "描述": "对部署者的隔离缺口，不是靶场关卡。拦截规则未命中且模型审批关闭时工具直接放行。内置「数据外泄管道」规则默认关闭，内置规则可被管理员停用。自定义 Python 以本进程用户和进程环境执行。目标返回的内容会进入模型上下文。Bash 的具体执行代码在外部模块 norma，本单未读。",
+      "建议": "把智能体工具放进单独的低权限用户或容器，且不要把数据目录与密钥以可写方式暴露给该环境。未命中规则时默认改为询问。外泄类规则默认开启。",
+      "位置": [
+        {"路径": "guard/guard.go", "行号": 92, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/guard/guard.go#L92"},
+        {"路径": "db/db.go", "行号": 542, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/db/db.go#L542"},
+        {"路径": "db/db.go", "行号": 570, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/db/db.go#L570"},
+        {"路径": "server/customtool.go", "行号": 399, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/server/customtool.go#L399"}
+      ],
+      "旧结论": "旧报告未单独列出此条。本单在当前树上确认"
+    },
+    {
+      "id": "F-03",
+      "级别": "中",
+      "类别": "代码安全",
+      "路径": "traffic/traffic.go",
+      "行号": 206,
+      "commit_sha": "253a8eeac3b278cd4ff383674a31a0edcc34e143",
+      "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/traffic/traffic.go#L206",
+      "确认状态": "已确认",
+      "描述": "流量记录代理没有认证，并对上游 TLS 关闭证书校验。二进制默认绑 127.0.0.1:8788。镜像 CMD 使用 :8788，容器内所有网卡可连。Compose 只把宿主侧端口限制在 127.0.0.1。同一 Docker 网络中的其他容器仍可使用该代理。",
+      "建议": "镜像 CMD 与二进制默认保持 127.0.0.1。不要把 8788 发布到非回环地址。若必须跨容器使用，加上认证。",
+      "位置": [
+        {"路径": "cmd/artex/main.go", "行号": 57, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/cmd/artex/main.go#L57"},
+        {"路径": "Dockerfile", "行号": 47, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/Dockerfile#L47"},
+        {"路径": "docker-compose.yml", "行号": 34, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/docker-compose.yml#L34"},
+        {"路径": "traffic/traffic.go", "行号": 206, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/traffic/traffic.go#L206"}
+      ],
+      "旧结论": "旧报告未单独列出。绑定差异在当前树上确认"
+    },
+    {
+      "id": "F-04",
+      "级别": "中",
+      "类别": "代码安全",
+      "路径": "Dockerfile",
+      "行号": 46,
+      "commit_sha": "253a8eeac3b278cd4ff383674a31a0edcc34e143",
+      "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/Dockerfile#L46",
+      "确认状态": "已确认",
+      "描述": "运行镜像没有 USER 指令，进程以 root 启动。Compose 把宿主机 ./data（注释写明含 jwt.key）和 ./skills 挂进容器。进程被控制时可以直接改宿主上的这些目录。未看到 docker.sock 挂载。",
+      "建议": "使用非 root 用户。数据卷只放需要持久化的数据，签名密钥与工具执行环境分开。",
+      "位置": [
+        {"路径": "Dockerfile", "行号": 13, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/Dockerfile#L13"},
+        {"路径": "Dockerfile", "行号": 46, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/Dockerfile#L46"},
+        {"路径": "docker-compose.yml", "行号": 35, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/docker-compose.yml#L35"}
+      ],
+      "旧结论": "Dockerfile 相对旧基准未改。结论在当前树上确认"
+    },
+    {
+      "id": "F-05",
+      "级别": "中",
+      "类别": "代码安全",
+      "路径": "server/auth.go",
+      "行号": 115,
+      "commit_sha": "253a8eeac3b278cd4ff383674a31a0edcc34e143",
+      "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/server/auth.go#L115",
+      "确认状态": "已确认",
+      "描述": "管理员 JWT 有效期 7 天，可从查询参数 token 读取。前端 SSE 把令牌放进 URL。未见管理员 JWT 的服务端吊销。令牌会出现在访问日志、代理日志和浏览器历史中。MCP 访问令牌有吊销，与管理员 JWT 不是同一套。",
+      "建议": "SSE 改为只接受短时票据或请求头。缩短管理员 JWT 寿命，并提供服务端失效。",
+      "位置": [
+        {"路径": "server/auth.go", "行号": 22, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/server/auth.go#L22"},
+        {"路径": "server/auth.go", "行号": 106, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/server/auth.go#L106"},
+        {"路径": "web/src/lib/api.ts", "行号": 293, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/web/src/lib/api.ts#L293"},
+        {"路径": "web/src/lib/api.ts", "行号": 323, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/web/src/lib/api.ts#L323"}
+      ],
+      "旧结论": "当前树上确认。旧报告是否已列此条：无法再核实"
+    },
+    {
+      "id": "F-06",
+      "级别": "中",
+      "类别": "供应链",
+      "路径": "Dockerfile",
+      "行号": 21,
+      "commit_sha": "253a8eeac3b278cd4ff383674a31a0edcc34e143",
+      "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/Dockerfile#L21",
+      "确认状态": "模式已确认；远端内容未核实为恶意",
+      "描述": "镜像构建把 NodeSource setup 脚本管道交给 bash，并以 @latest 全局安装 Playwright 相关包，没有锁文件或校验和。install.sh 把 get.docker.com 管道交给 sh。Compose 默认镜像 tag 为 latest，基础镜像只有标签、没有 digest。",
+      "建议": "固定 Node 与 npm 包版本并校验和。安装脚本改为发行版包或带校验和的二进制。镜像使用 digest。",
+      "位置": [
+        {"路径": "Dockerfile", "行号": 21, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/Dockerfile#L21"},
+        {"路径": "Dockerfile", "行号": 29, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/Dockerfile#L29"},
+        {"路径": "install.sh", "行号": 22, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/install.sh#L22"},
+        {"路径": "docker-compose.yml", "行号": 3, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/docker-compose.yml#L3"},
+        {"路径": "docker-compose.yml", "行号": 18, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/docker-compose.yml#L18"}
+      ],
+      "旧结论": "Dockerfile 与 install.sh 相对旧基准未改"
+    },
+    {
+      "id": "F-07",
+      "级别": "中",
+      "类别": "供应链",
+      "路径": "internal/webfetch/webfetch.go",
+      "行号": 23,
+      "commit_sha": "253a8eeac3b278cd4ff383674a31a0edcc34e143",
+      "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/internal/webfetch/webfetch.go#L23",
+      "确认状态": "通告与引用已确认；可利用性未验证",
+      "描述": "go.mod 要求 golang.org/x/net v0.61.0。2026-11-26 09:37 香港时间的 OSV 查询对该版本返回 GO-2026-6860 与 GO-2026-6866，摘要涉及 html 文本节点与原始文本渲染。本树 webfetch 引用 golang.org/x/net/html，并抓取外部页面。未做动态验证，不把通告写成已复现的漏洞。",
+      "建议": "升到通告修复版本后回归抓取路径。在升级前把单次解析的输入大小维持在现有上限内。",
+      "位置": [
+        {"路径": "go.mod", "行号": 15, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/go.mod#L15"},
+        {"路径": "internal/webfetch/webfetch.go", "行号": 23, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/internal/webfetch/webfetch.go#L23"}
+      ],
+      "旧结论": "已变化。旧树要求 v0.58.0，现为 v0.61.0，当前版本仍命中上述两条"
+    },
+    {
+      "id": "F-08",
+      "级别": "未定",
+      "类别": "供应链",
+      "路径": "web/package.json",
+      "行号": 50,
+      "commit_sha": "253a8eeac3b278cd4ff383674a31a0edcc34e143",
+      "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/web/package.json#L50",
+      "确认状态": "未确认",
+      "描述": "锁文件中的 next@16.2.9 在同一次 OSV 查询命中 25 条 GHSA，其中若干摘要写未认证远程代码执行（图像优化、Server Actions、next/og）。发布文档路径是 NEXT_EXPORT 静态导出后由 Go 提供页面，不是 next start。未逐条核对通告是否覆盖静态导出。不把这些通告计为已确认的高危。",
+      "建议": "核对每条 GHSA 的受影响运行模式。对外只提供静态导出。若有人使用 next start 或 next dev 对外服务，按通告升级。",
+      "位置": [
+        {"路径": "web/package.json", "行号": 50, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/web/package.json#L50"},
+        {"路径": "web/next.config.mjs", "行号": 21, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/web/next.config.mjs#L21"}
+      ],
+      "旧结论": "无法再核实旧报告是否已列"
+    },
+    {
+      "id": "F-09",
+      "级别": "低",
+      "类别": "代码安全",
+      "路径": ".env.example",
+      "行号": 6,
+      "commit_sha": "253a8eeac3b278cd4ff383674a31a0edcc34e143",
+      "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/.env.example#L6",
+      "确认状态": "已确认",
+      "描述": "示例环境文件第 6 行给出可预期的 Postgres 口令占位。Compose 不向宿主发布 5432。变量未设置时 Compose 会拒绝启动。只有操作者原样复制示例并且另把数据库端口暴露出去时，该占位才变成可连口令。不抄录占位值。",
+      "建议": "示例文件不要放可直接使用的口令。安装脚本已能生成随机口令，示例可改为空值并强制替换。",
+      "位置": [
+        {"路径": ".env.example", "行号": 6, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/.env.example#L6"},
+        {"路径": "docker-compose.yml", "行号": 6, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/docker-compose.yml#L6"}
+      ],
+      "旧结论": "占位仍在。本单不把它升为高危"
+    },
+    {
+      "id": "F-10",
+      "级别": "低",
+      "类别": "代码安全",
+      "路径": "server/auth.go",
+      "行号": 264,
+      "commit_sha": "253a8eeac3b278cd4ff383674a31a0edcc34e143",
+      "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/server/auth.go#L264",
+      "确认状态": "已确认",
+      "描述": "登录处理未见失败次数限制或临时锁定。口令至少 8 个字符并使用 bcrypt。登录名错误与口令错误返回同一句提示。在线猜测成本较高，但没有应用层限速。",
+      "建议": "对登录与初始化接口加来源限速。",
+      "位置": [
+        {"路径": "server/auth.go", "行号": 264, "证据链接": "https://github.com/RuoJi6/ARTEX/blob/253a8eeac3b278cd4ff383674a31a0edcc34e143/server/auth.go#L264"}
+      ],
+      "旧结论": "无法再核实旧报告是否已列"
+    }
+  ]
+}
