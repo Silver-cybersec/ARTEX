@@ -362,7 +362,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS llm_profiles (
     id               BIGSERIAL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,
-    format           TEXT NOT NULL CHECK (format IN ('openai','anthropic','openai-responses','jev')),
+    format           TEXT NOT NULL CHECK (format IN ('openai','anthropic','openai-responses','gemini','jev')),
     base_url         TEXT,
     proxy            TEXT,
     model            TEXT NOT NULL,
@@ -390,7 +390,7 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     --   ''                      = max_tokens(默认，兼容绝大多数网关)
     --   'max_completion_tokens' = 新字段；OpenAI 推理模型(o 系列/GPT-5)只认它，
     --                             发 max_tokens 会被 unsupported_parameter 拒绝。
-    -- anthropic(max_tokens 必填)与 openai-responses(max_output_tokens)自带字段名，不受此值影响。
+    -- anthropic(max_tokens 必填)、openai-responses(max_output_tokens)与 gemini(maxOutputTokens)自带字段名，不受此值影响。
     max_tokens_field TEXT NOT NULL DEFAULT '',
     -- 自定义会话头：非空时每次请求带一个该名字的 HTTP 头，头值=当前运行的 session id
     -- (chat 会话/worker 意图)。用于某些按 session-id 头做提示缓存/粘性路由的网关。''=不发送。
@@ -415,11 +415,11 @@ ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS priority     INTEGER NOT NULL 
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS pool_exclude BOOLEAN NOT NULL DEFAULT false;
 -- 流式开关；补旧库。默认 true = 保持既有的流式行为，旧配置无感升级。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS streaming    BOOLEAN NOT NULL DEFAULT true;
--- 放开 format 约束以容纳 openai-responses(OpenAI Responses API)和 Jev System One；补旧库。
--- 每次启动执行,幂等:先删旧 CHECK 再建含三值的新 CHECK。
+-- 放开 format 约束以容纳 openai-responses(OpenAI Responses API)、gemini(Google Gemini)和 Jev System One；补旧库。
+-- 每次启动执行,幂等:先删旧 CHECK 再建新 CHECK。
 ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_format_check;
 ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_format_check
-    CHECK (format IN ('openai','anthropic','openai-responses','jev'));
+    CHECK (format IN ('openai','anthropic','openai-responses','gemini','jev'));
 
 -- 输出上限及其字段名；补旧库。默认 0 / '' = 不发送上限、沿用 max_tokens 字段名，
 -- 旧配置行为完全不变。
@@ -523,6 +523,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     company_id     BIGINT REFERENCES companies(id) ON DELETE SET NULL,
     parent_ref     TEXT,
     timeout_seconds INTEGER NOT NULL DEFAULT 0,
+    no_result_seconds INTEGER NOT NULL DEFAULT 0,
+    no_result_min_findings INTEGER NOT NULL DEFAULT 1,
+    no_result_min_severity TEXT NOT NULL DEFAULT '',
+    no_result_base_seconds BIGINT NOT NULL DEFAULT 0,
+    no_result_checked_at TIMESTAMPTZ,
+    stop_reason TEXT NOT NULL DEFAULT '',
     plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300,
     coverage_enabled BOOLEAN NOT NULL DEFAULT true,
     worker_count   INTEGER NOT NULL DEFAULT 0, -- 0=用全局默认 workers
@@ -537,6 +543,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Opt-in checkpoint based on active runtime; defaults preserve existing tasks.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS no_result_seconds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS no_result_min_findings INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS no_result_min_severity TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS no_result_base_seconds BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS no_result_checked_at TIMESTAMPTZ;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS stop_reason TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_tasks_alive  ON tasks(created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)          WHERE deleted_at IS NULL;
 DROP TRIGGER IF EXISTS trg_tasks_upd ON tasks;
@@ -1638,3 +1651,52 @@ CREATE INDEX IF NOT EXISTS idx_task_intelligence_assets ON task_intelligence USI
 
 -- Optional derived credential presentation; raw intelligence remains authoritative.
 ALTER TABLE task_intelligence ADD COLUMN IF NOT EXISTS credential_analysis JSONB;
+
+-- =====================================================================
+-- MCP server (ARTEX 作为 MCP 服务端，供外部智能体编排任务)
+--   api_tokens       访问令牌：长期、可吊销、可限权，只存 SHA-256，明文仅创建时返回一次
+--   api_token_tasks  令牌建过的任务，用于并发/每小时限额
+--   mcp_audit_log    每次 tools/call 的审计记录
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id                 BIGSERIAL PRIMARY KEY,
+    name               TEXT NOT NULL,
+    -- SHA-256(明文) 的十六进制。令牌本身是 32 字节随机数，不需要 bcrypt 这类慢哈希。
+    token_hash         TEXT NOT NULL UNIQUE,
+    -- 明文前缀，仅用于在列表里辨认是哪一个令牌。
+    token_prefix       TEXT NOT NULL,
+    -- 权限范围：read / task:create / task:control，由 server 侧白名单校验。
+    scopes             JSONB NOT NULL DEFAULT '[]',
+    -- 限定企业：非空时只能在这些企业下建任务、也只能看到/控制这些企业下的任务。
+    company_ids        JSONB NOT NULL DEFAULT '[]',
+    -- 限额，0 = 不限。max_active_tasks 统计本令牌建的、尚未进入终态的任务(含暂停/排队)。
+    max_active_tasks   INTEGER NOT NULL DEFAULT 0,
+    max_tasks_per_hour INTEGER NOT NULL DEFAULT 0,
+    expires_at         TIMESTAMPTZ,
+    last_used_at       TIMESTAMPTZ,
+    revoked_at         TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- task_id 不加外键：任务删除后这行仍要计入「每小时建任务数」，否则建了就删可绕过限额。
+CREATE TABLE IF NOT EXISTS api_token_tasks (
+    token_id   BIGINT NOT NULL REFERENCES api_tokens(id) ON DELETE CASCADE,
+    task_id    BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (token_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_api_token_tasks_recent ON api_token_tasks(token_id, created_at DESC);
+
+-- token_id 不加外键：令牌删除后审计仍要留存，token_name 冗余保存当时的名称。
+CREATE TABLE IF NOT EXISTS mcp_audit_log (
+    id          BIGSERIAL PRIMARY KEY,
+    token_id    BIGINT NOT NULL,
+    token_name  TEXT NOT NULL DEFAULT '',
+    tool        TEXT NOT NULL,
+    args        TEXT NOT NULL DEFAULT '',
+    ok          BOOLEAN NOT NULL,
+    result      TEXT NOT NULL DEFAULT '',
+    remote_addr TEXT NOT NULL DEFAULT '',
+    duration_ms BIGINT NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);

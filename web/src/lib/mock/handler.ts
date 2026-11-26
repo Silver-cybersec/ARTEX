@@ -36,6 +36,9 @@ import type {
 } from "../types";
 import { MAX_TASK_REMARK_RUNES, MAX_TASK_WORKER_COUNT } from "../types";
 import * as D from "./data";
+import { createMockNotifications } from "./notifications";
+import { createMockSchedules } from "./schedules";
+import { mockTaskFileRead, mockTaskFiles } from "./task-files";
 
 const delay = (ms = 120) => new Promise((r) => setTimeout(r, ms));
 
@@ -45,11 +48,14 @@ const mockInterceptHistory = structuredClone(D.interceptHistory);
 const mockInterceptPending = structuredClone(D.interceptPending);
 const mockInterceptDetails = structuredClone(D.interceptDetails);
 const mockTasks = structuredClone(D.tasks);
+const mockWorkerDrainUntil = new Map<string, number>();
 const mockFindings = structuredClone(D.findings);
 const mockLLMRecords = structuredClone(D.llmRecords);
 const mockTaskTemplates = structuredClone(D.taskTemplates);
 const mockTaskCategories = structuredClone(D.taskCategories);
 const mockConversations = structuredClone(D.conversations);
+const mockNotifications = createMockNotifications();
+const mockSchedules = createMockSchedules();
 const mockRetests: FindingRetest[] = [];
 const mockRetestMessages: Record<number, Activity[]> = {};
 
@@ -251,8 +257,35 @@ function mockTaskArchiveBlocker(taskID: string): string | undefined {
   )?.id;
 }
 
+function reconcileMockWorkers(task: Task): void {
+  const target = task.worker_count || D.settings.workers || 3;
+  const previousTarget = task.worker_target_count;
+  task.worker_target_count = target;
+  if (task.status !== "running" && task.status !== "paused") {
+    task.worker_actual_count = 0;
+    mockWorkerDrainUntil.delete(task.id);
+    return;
+  }
+  const actual = task.worker_actual_count ?? target;
+  if (actual <= target) {
+    task.worker_actual_count = target;
+    mockWorkerDrainUntil.delete(task.id);
+  } else {
+    // Demo loops drain independently of in_flight; retain them across polls briefly.
+    if (!mockWorkerDrainUntil.has(task.id) || previousTarget !== target) {
+      mockWorkerDrainUntil.set(task.id, Date.now() + 10_000);
+    }
+    if (Date.now() >= (mockWorkerDrainUntil.get(task.id) ?? 0)) {
+      task.worker_actual_count = target;
+      mockWorkerDrainUntil.delete(task.id);
+    }
+  }
+}
+
 function publicMockTask(task: Task): Task {
+  reconcileMockWorkers(task);
   const item = structuredClone(task);
+  item.numeric_id = mockTaskAssetIDs.get(task.id);
   item.share_global_assets = task.share_global_assets ?? false;
   const blocker = mockTaskArchiveBlocker(task.id);
   if (blocker) item.archive_blocked_by_task_id = blocker;
@@ -477,6 +510,10 @@ function mockFilterFindings(q: URLSearchParams): (typeof mockFindings)[number][]
   if (vulnclass) list = list.filter((finding) => finding.vulnclass === vulnclass);
   if (taskID === "__unassigned__") list = list.filter((finding) => !finding.task_id);
   else if (taskID) list = list.filter((finding) => finding.task_id === taskID);
+  const fromTs = q.get("from") ? Date.parse(q.get("from") as string) : Number.NaN;
+  const toTs = q.get("to") ? Date.parse(q.get("to") as string) : Number.NaN;
+  if (Number.isFinite(fromTs)) list = list.filter((finding) => Date.parse(finding.ts) >= fromTs);
+  if (Number.isFinite(toTs)) list = list.filter((finding) => Date.parse(finding.ts) <= toTs);
   return list;
 }
 
@@ -953,7 +990,8 @@ function controlMockTask(id: string, action: "pause" | "resume"): BatchControlIt
     task.status = "paused";
     task.engine_mode = "paused";
     if (task.run_segment_started_unix && task.run_segment_started_unix > 0) {
-      task.active_run_seconds = (task.active_run_seconds ?? 0) + Math.max(0, Math.floor(Date.now() / 1000) - task.run_segment_started_unix);
+      task.active_run_seconds =
+        (task.active_run_seconds ?? 0) + Math.max(0, Math.floor(Date.now() / 1000) - task.run_segment_started_unix);
       task.run_seconds = task.active_run_seconds;
     }
     task.run_segment_started_unix = 0;
@@ -1054,6 +1092,38 @@ export async function mockHandle<T>(method: string, rawPath: string, body?: Body
 
 function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Record<string, unknown>): unknown {
   const task = q.get("task") ?? undefined;
+  if (seg[0] === "tasks" && seg[2] === "files") {
+    if (!mockTasks.some((item) => item.id === seg[1] || mockTaskAssetID(item.id) === Number(seg[1])))
+      throw new Error("taskFiles.unavailable");
+    return seg[3] === "read"
+      ? mockTaskFileRead(q.get("path") ?? "")
+      : mockTaskFiles(q.get("path") ?? "", seg[3] === "all");
+  }
+
+  if (seg[0] === "schedules") return mockSchedules(m, path, b, new Set(mockTaskAssetIDs.values()));
+
+  if (seg[0] === "notify") return mockNotifications(m, path, q, b, D.settings);
+
+  // No intelligence is generated in the preview. Return the real list contract
+  // for both entry points instead of falling through to the generic {} reply.
+  if ((seg[0] === "tasks" || seg[0] === "assets") && seg[2] === "intelligence") {
+    const exists =
+      seg[0] === "tasks"
+        ? mockTasks.some((item) => item.id === seg[1] || mockTaskAssetID(item.id) === Number(seg[1]))
+        : mockAssets.some((item) => item.id === Number(seg[1]));
+    if (!exists) throw new Error("任务或资产不存在");
+    if (m === "GET" && seg.length === 3) {
+      return {
+        items: [],
+        total: 0,
+        counts: { credential: 0, lead: 0, sensitive_data: 0 },
+        enabled: D.settings.task_intelligence_enabled,
+        credential_agent_enabled: D.settings.credential_agent_enabled,
+        credential_traffic_binding: D.settings.credential_agent_enabled && D.settings.credential_traffic_binding,
+      };
+    }
+    throw new Error("情报不存在或不属于当前范围");
+  }
 
   // The demo client still expects the complete repeater response shape. No
   // network request is made in mock mode, but returning the shape keeps the
@@ -1243,6 +1313,11 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const categoryID = mockIntegerField(b.category_id, "category_id") ?? undefined;
     const category = categoryID === undefined ? undefined : mockTaskCategories.find((item) => item.id === categoryID);
     if (categoryID !== undefined && !category) throw new Error("任务分类不存在");
+    const noResultSeconds = Math.max(0, mockIntegerField(b.no_result_seconds, "no_result_seconds") ?? 0);
+    const noResultSeverity = String(b.no_result_min_severity ?? "");
+    if (!["", "low", "medium", "high", "critical"].includes(noResultSeverity)) {
+      throw new Error("invalid no_result_min_severity");
+    }
     const created: Task = {
       id,
       name,
@@ -1251,6 +1326,10 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       category_name: category?.name,
       description: description || "新任务",
       goal,
+      no_result_seconds: noResultSeconds > 0 ? Math.max(60, noResultSeconds) : 0,
+      no_result_min_findings: Math.max(1, mockIntegerField(b.no_result_min_findings, "no_result_min_findings") ?? 1),
+      no_result_min_severity: noResultSeverity as Task["no_result_min_severity"],
+      stop_reason: "",
       worker_count: mockWorkerCount(b.worker_count),
       status: "created",
       created_at: now.toISOString(),
@@ -1275,7 +1354,18 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       company_ids: companyIDs,
       share_global_assets: b.share_global_assets === true,
     };
-    const numericTaskID = nextMockTaskAssetID++;
+    reconcileMockWorkers(created);
+    // Validate the attached preview schedule before mutating task state.
+    const numericTaskID = nextMockTaskAssetID;
+    if (b.schedule && typeof b.schedule === "object") {
+      mockSchedules(
+        "POST",
+        "/schedules",
+        { ...b.schedule, task_ids: [numericTaskID] },
+        new Set([...mockTaskAssetIDs.values(), numericTaskID]),
+      );
+    }
+    nextMockTaskAssetID++;
     mockTaskAssetIDs.set(id, numericTaskID);
     const selectedCompanies = new Set(companyIDs);
     for (const asset of mockAssets) {
@@ -1402,7 +1492,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "task-templates" && seg.length === 2 && m === "PATCH") {
     const template = mockTaskTemplates.find((item) => item.id === Number(seg[1]));
     if (!template) return {};
-    const has = (key: string) => Object.prototype.hasOwnProperty.call(b, key);
+    const has = (key: string) => Object.hasOwn(b, key);
     const nameValue = has("name") ? mockStringField(b.name, "模板名称") : undefined;
     const descriptionValue = has("description") ? mockStringField(b.description, "模板描述") : undefined;
     const goalValue = has("goal") ? mockStringField(b.goal, "模板目标") : undefined;
@@ -1411,7 +1501,8 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       throw new Error("intercept_rules 必须是数组");
     }
     const name = nameValue === undefined || b.name === null ? template.name : normalizedTemplateName(nameValue);
-    const description = descriptionValue === undefined || b.description === null ? template.description : descriptionValue.trim();
+    const description =
+      descriptionValue === undefined || b.description === null ? template.description : descriptionValue.trim();
     const goal = goalValue === undefined || b.goal === null ? template.goal : goalValue.trim();
     if (!name || !description || !goal) throw new Error("请填写模板名称、描述和目标");
     if (
@@ -1458,16 +1549,20 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "tasks" && seg.length === 2 && m === "PATCH") {
     const task = mockTasks.find((item) => item.id === seg[1]);
     if (!task) throw new Error("任务不存在");
-    const has = (key: string) => Object.prototype.hasOwnProperty.call(b, key);
+    const has = (key: string) => Object.hasOwn(b, key);
     if (has("name") && b.name !== null && typeof b.name !== "string") throw new Error("任务名称必须是字符串");
     if (has("remark") && b.remark !== null && typeof b.remark !== "string") throw new Error("备注必须是字符串");
     if (has("pinned") && b.pinned !== null && typeof b.pinned !== "boolean") throw new Error("pinned 必须是布尔值");
-    if (has("share_global_assets") && b.share_global_assets !== null && typeof b.share_global_assets !== "boolean") throw new Error("share_global_assets 必须是布尔值");
+    if (has("share_global_assets") && b.share_global_assets !== null && typeof b.share_global_assets !== "boolean")
+      throw new Error("share_global_assets 必须是布尔值");
     const sharingPresent = has("share_global_assets") && b.share_global_assets !== null;
     const namePresent = has("name") && b.name !== null;
     const remarkPresent = has("remark") && b.remark !== null;
     const pinnedPresent = has("pinned") && b.pinned !== null;
-    if (!namePresent && !remarkPresent && !pinnedPresent && !sharingPresent) throw new Error("至少需要提供 name、pinned、remark 或 share_global_assets");
+    const workerCountPresent = has("worker_count") && b.worker_count !== null;
+    const nextWorkerCount = workerCountPresent ? mockWorkerCount(b.worker_count) : task.worker_count;
+    if (!namePresent && !remarkPresent && !pinnedPresent && !sharingPresent && !workerCountPresent)
+      throw new Error("至少需要提供 name、pinned、remark、share_global_assets 或 worker_count");
     let nextName = task.name;
     let nextRemark = task.remark;
     let nextPinned = task.pinned;
@@ -1489,8 +1584,9 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     task.remark = nextRemark;
     task.pinned = nextPinned;
     task.pinned_at = nextPinnedAt;
+    task.worker_count = nextWorkerCount;
     sortMockTasks();
-    return structuredClone(task);
+    return publicMockTask(task);
   }
   if (seg[0] === "tasks" && seg.length === 2 && m === "DELETE") {
     const id = seg[1];
@@ -1739,8 +1835,24 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     };
 
   // ── 工作空间文件管理器（demo：静态示例树；写/建/删走下方写兜底 {ok:true}）──
-  if (path === "/workspace/list") return D.workspaceList(q.get("path") ?? "");
-  if (path === "/workspace/read") return D.workspaceRead(q.get("path") ?? "");
+  if (path === "/workspace/list") {
+    const value = q.get("path") ?? "";
+    const taskPath = value.match(/^tasks\/[^/]+(?:\/(.*))?$/);
+    if (taskPath) {
+      const result = mockTaskFiles(taskPath[1] ?? "");
+      return {
+        ...result,
+        path: value,
+        entries: result.entries.map((entry) => ({ ...entry, path: `tasks/${value.split("/")[1]}/${entry.path}` })),
+      };
+    }
+    return D.workspaceList(value);
+  }
+  if (path === "/workspace/read") {
+    const value = q.get("path") ?? "";
+    if (value.startsWith("tasks/")) return { ...mockTaskFileRead(value.split("/").slice(2).join("/")), path: value };
+    return D.workspaceRead(value);
+  }
 
   // ── stats ──
   if (path === "/stats") {
@@ -2049,6 +2161,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
         task_name: owner?.name ?? "",
         task_description: owner?.description ?? items[0]?.task_description ?? "",
         task_status: owner?.status ?? "",
+        task_stop_reason: owner?.stop_reason ?? "",
         count: items.length,
         critical: items.filter((finding) => finding.severity === "critical").length,
         high: items.filter((finding) => finding.severity === "high").length,
@@ -2239,6 +2352,11 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "exploration" && seg[1] === "findings" && seg.length === 3 && seg[2] !== "stats") {
     const f = mockFindings.find((x) => x.id === seg[2]);
     if (!f) return {};
+    if (m === "DELETE") {
+      const idx = mockFindings.findIndex((x) => x.id === seg[2]);
+      if (idx >= 0) mockFindings.splice(idx, 1);
+      return { deleted: idx >= 0, id: Number(seg[2]) || 0 };
+    }
     if (m === "PATCH") {
       if (typeof b.status === "string") f.status = b.status as typeof f.status;
       if (typeof b.severity === "string") f.severity = b.severity as typeof f.severity;
@@ -2261,6 +2379,41 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     };
   }
   if (path === "/exploration/findings") {
+    if (m === "DELETE") {
+      const scope = (typeof b.scope === "string" ? b.scope : q.get("scope"))?.trim() ?? "";
+      let targets: (typeof mockFindings)[number][] = [];
+      if (scope === "all") {
+        targets = [...mockFindings];
+      } else if (scope === "selected") {
+        const rawIds = Array.isArray(b.ids)
+          ? b.ids.map((v) => String(v))
+          : (q.get("ids") ?? "")
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean);
+        const idSet = new Set(rawIds);
+        targets = mockFindings.filter((f) => idSet.has(f.id));
+      } else if (scope === "filtered") {
+        const params = new URLSearchParams(q);
+        if (b.filters && typeof b.filters === "object") {
+          for (const [k, v] of Object.entries(b.filters as Record<string, unknown>)) {
+            if (typeof v === "string" && v) params.set(k, v);
+          }
+        }
+        targets = mockApplyAssetScope(mockFilterFindings(params), params.get("asset_scope"));
+      } else {
+        throw new Error(`bad scope: ${scope}`);
+      }
+      const targetSet = new Set(targets.map((f) => f.id));
+      let deleted = 0;
+      for (let i = mockFindings.length - 1; i >= 0; i--) {
+        if (targetSet.has(mockFindings[i].id)) {
+          mockFindings.splice(i, 1);
+          deleted++;
+        }
+      }
+      return { deleted };
+    }
     // finding_id=id：真后端用独立表行 id 作为状态/详情句柄,mock 里用自身 id 顶上。
     // report 仅详情接口返回,列表剥掉(与后端一致)。
     const withFid = (f: (typeof mockFindings)[number]) => ({
@@ -2385,11 +2538,17 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       next.workers = next.worker_pools.reduce((sum, pool) => sum + Number(pool.workers), 0);
     }
     Object.assign(D.settings, next);
+    for (const task of mockTasks) reconcileMockWorkers(task);
     return next;
   }
   if (path === "/settings/basic-auth" && m === "GET") return { enabled: false, username: "", password_set: false };
   if (path === "/settings/basic-auth" && m === "PUT")
-    throw new Error("演示模式不支持修改 HTTP Basic Auth，请在实际部署中配置");
+    throw Object.assign(new Error("演示模式不支持修改 HTTP Basic Auth，请在实际部署中配置"), {
+      code: "demo_basic_auth_disabled",
+    });
+  if (path === "/system/backup/status") return { pending: false, last_restore: null };
+  if (path === "/system/backup/restore")
+    throw Object.assign(new Error("演示模式不支持备份与恢复，请在实际部署中使用"), { code: "demo_backup_disabled" });
   if (path === "/settings/web-search/test") return { ok: true, count: 5, backend: D.settings.web_search_backend };
   if (path === "/settings/proxy/test")
     return {
@@ -2408,17 +2567,33 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
           label: "② 经全局代理的出口 IP",
           skipped: true,
           skip_reason: "输入框为空，未配置代理",
+          skip_code: "no_proxy",
           result: { ok: false, latency_ms: 0, probes: [] },
         },
       ],
       warnings: [],
     };
-  if (path === "/settings/proxy-pool" && m === "GET") return { entries: D.settings.proxy_pool ?? [], active_id: D.settings.proxy_pool_active_id ?? "", active_proxy: D.settings.global_proxy ?? "", switch_log: [] };
-  if (path === "/settings/proxy-pool/import" && m === "POST") return { entries: D.settings.proxy_pool ?? [], active_id: D.settings.proxy_pool_active_id ?? "", switch_log: [], errors: [] };
-  if (path === "/settings/proxy-pool/test-all" && m === "POST") return { entries: D.settings.proxy_pool ?? [], active_id: D.settings.proxy_pool_active_id ?? "", switch_log: [] };
-  if (path.startsWith("/settings/proxy-pool/") && m === "PUT") return { entry: { ...(D.settings.proxy_pool ?? []).find((x) => x.id === path.split("/").at(-1)), ...b } };
+  if (path === "/settings/proxy-pool" && m === "GET")
+    return {
+      entries: D.settings.proxy_pool ?? [],
+      active_id: D.settings.proxy_pool_active_id ?? "",
+      active_proxy: D.settings.global_proxy ?? "",
+      switch_log: [],
+    };
+  if (path === "/settings/proxy-pool/import" && m === "POST")
+    return {
+      entries: D.settings.proxy_pool ?? [],
+      active_id: D.settings.proxy_pool_active_id ?? "",
+      switch_log: [],
+      errors: [],
+    };
+  if (path === "/settings/proxy-pool/test-all" && m === "POST")
+    return { entries: D.settings.proxy_pool ?? [], active_id: D.settings.proxy_pool_active_id ?? "", switch_log: [] };
+  if (path.startsWith("/settings/proxy-pool/") && m === "PUT")
+    return { entry: { ...(D.settings.proxy_pool ?? []).find((x) => x.id === path.split("/").at(-1)), ...b } };
   if (path.startsWith("/settings/proxy-pool/") && m === "DELETE") return { ok: true };
-  if (path.startsWith("/settings/proxy-pool/") && m === "POST") return { ok: true, active_id: path.split("/").at(-1), active_proxy: "" };
+  if (path.startsWith("/settings/proxy-pool/") && m === "POST")
+    return { ok: true, active_id: path.split("/").at(-1), active_proxy: "" };
   if (path === "/settings/python/detect") return { python_interpreter: "/usr/bin/python3" };
   if (path === "/chat")
     return { reply: "（demo）我已把该建议注入为一条高优意图，work agent 会尽快执行。", mode: "hint" };
@@ -2742,3 +2917,5 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     ? []
     : {};
 }
+
+export { mockTaskFileURL } from "./task-files";

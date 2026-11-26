@@ -5,7 +5,7 @@
 
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
-import { mockHandle } from "@/lib/mock/handler";
+import { mockHandle, mockTaskFileURL } from "@/lib/mock/handler";
 import type {
   ActiveFindingRetest,
   Activity,
@@ -34,8 +34,6 @@ import type {
   DeleteTaskResult,
   Edge,
   EgressReport,
-  ProxyPoolEntry,
-  ProxySwitchLog,
   EvidenceBodyPreview,
   ExplorationNodePage,
   ExplorationNodeQuery,
@@ -54,8 +52,6 @@ import type {
   FindingsPage,
   FindingTraffic,
   FindingTrafficDetail,
-  RepeaterSendRequest,
-  RepeaterSendResponse,
   IntelligencePage,
   IntentAsset,
   InterceptApprovalFilter,
@@ -82,6 +78,10 @@ import type {
   NotificationMeta,
   PromptVar,
   PromptVersion,
+  ProxyPoolEntry,
+  ProxySwitchLog,
+  RepeaterSendRequest,
+  RepeaterSendResponse,
   SessionTokenUsage,
   Settings,
   Severity,
@@ -90,6 +90,7 @@ import type {
   SSProject,
   SSTask,
   Stats,
+  SystemMetrics,
   Task,
   TaskArchive,
   TaskArchivePage,
@@ -97,6 +98,7 @@ import type {
   TaskAssetScopeMutation,
   TaskCategory,
   TaskConstraint,
+  TaskFileListing,
   TaskGoal,
   TaskIntelligence,
   TaskLLMResolutions,
@@ -118,7 +120,6 @@ import type {
   UsageStats,
   WorkspaceFile,
   WorkspaceListing,
-  SystemMetrics,
 } from "@/lib/types";
 
 /**
@@ -144,10 +145,101 @@ function getToken(): string | null {
   return localStorage.getItem("artex_token");
 }
 
+let basicAuthReloading = false;
+let basicAuthProbe: Promise<void> | null = null;
+
+// Renew the outer gate through a page navigation, where the browser can send
+// Basic credentials without replacing an API request's Bearer authorization.
+// Keep the admin token and collapse concurrent failures into one reload.
+export async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+  if (basicAuthReloading) throw new Error("访问验证已过期，正在重新验证");
+  const response = await fetch(input, init);
+  if (basicAuthReloading) throw new Error("访问验证已过期，正在重新验证");
+  if (response.status === 401 && response.headers.get("X-Artex-Auth") === "basic") {
+    basicAuthReloading = true;
+    window.location.reload();
+    throw new Error("访问验证已过期，正在重新验证");
+  }
+  return response;
+}
+
+export interface BackupStatus {
+  // 已上传、等待重启时恢复的备份。
+  pending: boolean;
+  // 本次启动时执行的恢复结果；未执行恢复时为 null。
+  last_restore: {
+    id?: string;
+    applied: boolean;
+    error?: string;
+    at: string;
+    source_version?: string;
+    backup_created_at?: string;
+  } | null;
+}
+
+export type McpServerScope = "read" | "task:create" | "task:control";
+
+export interface McpServerSettings {
+  enabled: boolean;
+  path: string;
+  basic_auth_enabled: boolean;
+  allowed_ips: string[];
+  trusted_proxies: string[];
+  // 服务端按 /mcp 的同一套规则解析出的、当前管理员请求的来源地址。
+  client_ip?: string;
+}
+
+export interface McpServerToken {
+  id: number;
+  name: string;
+  token_prefix: string;
+  scopes: McpServerScope[];
+  company_ids: number[];
+  max_active_tasks: number;
+  max_tasks_per_hour: number;
+  expires_at: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+export interface McpServerTokenInput {
+  name: string;
+  scopes: McpServerScope[];
+  company_ids: number[];
+  max_active_tasks: number;
+  max_tasks_per_hour: number;
+  expires_in_days: number;
+}
+
+export interface McpServerAuditEntry {
+  id: number;
+  token_id: number;
+  token_name: string;
+  tool: string;
+  args: string;
+  ok: boolean;
+  result: string;
+  remote_addr: string;
+  duration_ms: number;
+  created_at: string;
+}
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly code?: string,
+    public readonly params?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   const token = getToken();
-  const r = await fetch(`/api${path}`, {
+  const r = await apiFetch(`/api${path}`, {
     ...init,
     headers: {
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
@@ -155,26 +247,29 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       ...(init?.headers as Record<string, string> | undefined),
     },
   });
-  if (r.status === 401) {
-    if (typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
-      window.location.href = "/login";
-    }
-    throw new Error("未授权");
-  }
   if (!r.ok) {
-    const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
+    const fallback = r.status === 401 ? "未授权" : `${init?.method ?? "GET"} ${path}: ${r.status}`;
     let message = fallback;
+    let code: string | undefined = r.status === 401 ? "unauthorized" : undefined;
+    let params: Record<string, unknown> | undefined;
     try {
-      const payload = (await r.json()) as { error?: unknown };
+      const payload = (await r.json()) as { error?: unknown; code?: unknown; params?: unknown };
       if (typeof payload.error === "string" && payload.error.trim()) {
         message = payload.error.trim();
+      }
+      if (typeof payload.code === "string") code = payload.code;
+      if (payload.params && typeof payload.params === "object" && !Array.isArray(payload.params)) {
+        params = payload.params as Record<string, unknown>;
       }
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
-    throw new Error(message);
+    if (r.status === 401 && typeof window !== "undefined") {
+      localStorage.removeItem("artex_token");
+      document.cookie = "artex_token=; path=/; max-age=0";
+      window.location.href = "/login";
+    }
+    throw new ApiError(message, code, params);
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -236,7 +331,19 @@ export function openSSE(path: string): EventSource {
   // Same-origin streams already send cookies. Only opt into cross-port cookies
   // for the local Next/Go dev pair; keep custom remote SSE endpoints unchanged.
   const local = ["localhost", "127.0.0.1", "[::1]"].includes(target.hostname);
-  return new EventSource(url, { withCredentials: local && target.hostname === window.location.hostname });
+  const source = new EventSource(url, { withCredentials: local && target.hostname === window.location.hostname });
+  source.addEventListener("error", () => {
+    // EventSource hides the response status. Probe a same-origin auth endpoint
+    // to distinguish an expired gate from an ordinary stream/network failure.
+    if (basicAuthProbe !== null || basicAuthReloading) return;
+    basicAuthProbe = apiFetch("/api/auth/status", { cache: "no-store" })
+      .then(() => undefined)
+      .catch(() => undefined)
+      .finally(() => {
+        basicAuthProbe = null;
+      });
+  });
+  return source;
 }
 
 const get = <T>(p: string) => http<T>(p);
@@ -323,6 +430,33 @@ export const api = {
   version: () => http<{ version: string }>("/version", { cache: "no-store" }),
   systemMetrics: () => get<SystemMetrics>("/system/metrics"),
 
+  // ---- 一键备份 / 恢复 ----
+  backupStatus: () => get<BackupStatus>("/system/backup/status"),
+  // 备份包可能有数 GB：与任务文件下载一样先 HEAD 校验登录，再交给浏览器直接落盘（cookie 鉴权），不读进内存。
+  downloadBackup: async () => {
+    if (MOCK) throw new ApiError("演示模式不支持备份与恢复", "demo_backup_disabled");
+    const token = getToken();
+    const response = await apiFetch("/api/system/backup/export", {
+      method: "HEAD",
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!response.ok) {
+      const code = response.headers.get("X-Artex-Error-Code") ?? (response.status === 409 ? "backup_busy" : undefined);
+      throw new ApiError(`HEAD /system/backup/export: ${response.status}`, code);
+    }
+    const a = document.createElement("a");
+    a.href = "/api/system/backup/export";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  },
+  restoreBackup: (file: File) =>
+    http<{ ok: boolean; restore_id: string; version: string; created_at: string }>("/system/backup/restore", {
+      method: "POST",
+      body: file,
+      headers: { "Content-Type": "application/octet-stream" },
+    }),
+
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
   login: (username: string, password: string) => post<{ token: string }>("/auth/login", { username, password }),
@@ -344,6 +478,9 @@ export const api = {
     sourceTaskIds?: string[];
     companyIds?: number[];
     timeoutSeconds?: number;
+    noResultSeconds?: number;
+    noResultMinFindings?: number;
+    noResultMinSeverity?: "" | "low" | "medium" | "high" | "critical";
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
     shareGlobalAssets?: boolean;
@@ -362,6 +499,9 @@ export const api = {
       source_task_ids: input.sourceTaskIds ?? [],
       company_ids: input.companyIds ?? [],
       timeout_seconds: input.timeoutSeconds ?? 0,
+      no_result_seconds: input.noResultSeconds ?? 0,
+      no_result_min_findings: input.noResultMinFindings ?? 1,
+      no_result_min_severity: input.noResultMinSeverity ?? "",
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       share_global_assets: input.shareGlobalAssets ?? false,
@@ -382,8 +522,10 @@ export const api = {
   runScheduleNow: (id: number) =>
     post<{ ok: boolean; started: number; errors?: string[] }>(`/schedules/${id}/run-now`, {}),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
-  updateTask: (id: string, input: { name?: string; pinned?: boolean; remark?: string; share_global_assets?: boolean }) =>
-    patch<Task>(`/tasks/${id}`, input),
+  updateTask: (
+    id: string,
+    input: { name?: string; pinned?: boolean; remark?: string; share_global_assets?: boolean; worker_count?: number },
+  ) => patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),
@@ -399,11 +541,19 @@ export const api = {
     }),
   taskTemplates: () => get<{ templates: TaskTemplate[] }>("/task-templates").then((r) => arr(r.templates)),
   createTaskTemplate: (
-    input: Pick<TaskTemplate, "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count">,
+    input: Pick<
+      TaskTemplate,
+      "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count"
+    >,
   ) => post<TaskTemplate>("/task-templates", input),
   updateTaskTemplate: (
     id: number,
-    input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count">>,
+    input: Partial<
+      Pick<
+        TaskTemplate,
+        "name" | "description" | "goal" | "remark" | "category_id" | "intercept_rules" | "worker_count"
+      >
+    >,
   ) => patch<TaskTemplate>(`/task-templates/${id}`, input),
   deleteTaskTemplate: (id: number) => del<{ deleted: number }>(`/task-templates/${id}`),
   updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number) =>
@@ -542,6 +692,33 @@ export const api = {
   // 某资产在本任务里关联的意图 / 事实 / 发现（覆盖图节点抽屉用）。
   taskAssetRefs: (id: string, assetId: number) => get<CoverageAssetRefs>(`/tasks/${id}/asset-refs?asset_id=${assetId}`),
 
+  taskFiles: (id: string, path = "") => get<TaskFileListing>(`/tasks/${id}/files?path=${encodeURIComponent(path)}`),
+  taskFilesAll: (id: string) => get<TaskFileListing>(`/tasks/${id}/files/all`),
+  taskFileRead: (id: string, path: string) =>
+    get<WorkspaceFile>(`/tasks/${id}/files/read?path=${encodeURIComponent(path)}`),
+  // Browser downloads stream to disk using the same auth cookie as SSE. Avoid
+  // fetching ZIPs into a Blob, which would buffer the entire archive in memory.
+  taskFileDownload: async (id: string, path: string, archive = false) => {
+    const action = archive ? "archive" : "download";
+    if (!MOCK) {
+      const token = getToken();
+      const response = await apiFetch(`/api/tasks/${id}/files/${action}?path=${encodeURIComponent(path)}`, {
+        method: "HEAD",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!response.ok) throw new Error(response.status === 404 ? "taskFiles.unavailable" : "taskFiles.failed");
+    }
+    const a = document.createElement("a");
+    a.href = MOCK ? mockTaskFileURL(path, action) : `/api/tasks/${id}/files/${action}?path=${encodeURIComponent(path)}`;
+    a.download = archive ? `${path.split("/").pop() || `task-${id}`}.zip` : path.split("/").pop() || "download";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    if (MOCK && a.href.startsWith("blob:")) setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
+  },
+  taskFilePreview: (id: string, path: string) =>
+    MOCK ? mockTaskFileURL(path, "preview") : `/api/tasks/${id}/files/preview?path=${encodeURIComponent(path)}`,
+
   // ---- workspace file manager (workDir) ----
   workspaceList: (path = "") => get<WorkspaceListing>(`/workspace/list?path=${encodeURIComponent(path)}`),
   workspaceRead: (path: string) => get<WorkspaceFile>(`/workspace/read?path=${encodeURIComponent(path)}`),
@@ -554,7 +731,7 @@ export const api = {
     const fd = new FormData();
     for (const f of files) fd.append("file", f);
     const token = getToken();
-    const r = await fetch(`/api/workspace/upload?path=${encodeURIComponent(dir)}`, {
+    const r = await apiFetch(`/api/workspace/upload?path=${encodeURIComponent(dir)}`, {
       method: "POST",
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
@@ -569,7 +746,7 @@ export const api = {
       blob = new Blob([`（demo）${path} 的下载内容示例。`], { type: "text/plain" });
     } else {
       const token = getToken();
-      const r = await fetch(`/api/workspace/download?path=${encodeURIComponent(path)}`, {
+      const r = await apiFetch(`/api/workspace/download?path=${encodeURIComponent(path)}`, {
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       });
       if (!r.ok) throw new Error(`下载失败: ${r.status}`);
@@ -729,7 +906,7 @@ export const api = {
       for (const [k, v] of findingFilterParams(opts.filters)) p.set(k, v);
     }
     const token = getToken();
-    const r = await fetch(`/api/exploration/findings/export?${p.toString()}`, {
+    const r = await apiFetch(`/api/exploration/findings/export?${p.toString()}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (!r.ok) throw new Error(`export: ${r.status}`);
@@ -807,7 +984,7 @@ export const api = {
     contextTask?: string,
   ) => {
     const token = getToken();
-    const response = await fetch(
+    const response = await apiFetch(
       `/api/exploration/findings/${id}/traffic/${bindingId}/body?side=${side}&download=1${contextTask ? `&context_task=${encodeURIComponent(contextTask)}` : ""}`,
       { headers: token ? { Authorization: `Bearer ${token}` } : {} },
     );
@@ -834,6 +1011,30 @@ export const api = {
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
+  // 批量一键清理漏洞:按范围(当前筛选/全部/已勾选)移除 findings 记录及来源探索节点。
+  cleanupFindings: (opts: {
+    scope: "filtered" | "all" | "selected";
+    filters?: Omit<FindingQuery, "page" | "pageSize">;
+    ids?: string[];
+  }) => {
+    const body: Record<string, unknown> = { scope: opts.scope };
+    if (opts.scope === "selected") {
+      body.ids = opts.ids ?? [];
+    } else if (opts.scope === "filtered" && opts.filters) {
+      const f = opts.filters;
+      body.filters = {
+        ...(f.severity && f.severity !== "all" ? { severity: f.severity } : {}),
+        ...(f.status && f.status !== "all" ? { status: f.status } : {}),
+        ...(f.vulnclass && f.vulnclass !== "all" ? { vulnclass: f.vulnclass } : {}),
+        ...(f.task && f.task !== "all" ? { task_id: f.task } : {}),
+        ...(f.query?.trim() ? { q: f.query.trim() } : {}),
+        ...(f.from ? { from: f.from } : {}),
+        ...(f.to ? { to: f.to } : {}),
+        ...(f.assetScope ? { asset_scope: f.assetScope } : {}),
+      };
+    }
+    return del<{ deleted: number }>("/exploration/findings", body);
+  },
   findingRetests: (id: string) =>
     get<{ retests: FindingRetest[] }>(`/exploration/findings/${encodeURIComponent(id)}/retests`).then((r) =>
       arr(r.retests),
@@ -978,7 +1179,25 @@ export const api = {
 
   // ---- app settings (runtime toggles) ----
   intelligence: (scope: "tasks" | "assets", id: string, query: URLSearchParams) =>
-    get<IntelligencePage>(`/${scope}/${id}/intelligence?${query.toString()}`),
+    get<IntelligencePage>(`/${scope}/${id}/intelligence?${query.toString()}`).then((page) => {
+      if (
+        !page ||
+        !Array.isArray(page.items) ||
+        !page.counts ||
+        typeof page.counts !== "object" ||
+        Array.isArray(page.counts) ||
+        !["credential", "lead", "sensitive_data"].every((kind) => {
+          const count = page.counts[kind as keyof typeof page.counts];
+          return Number.isSafeInteger(count) && count >= 0;
+        }) ||
+        !Number.isSafeInteger(page.total) ||
+        page.total < 0 ||
+        typeof page.enabled !== "boolean"
+      ) {
+        throw new ApiError("情报数据响应不完整，请刷新后重试", "intelligence_response_invalid");
+      }
+      return page;
+    }),
   intelligenceDetail: (scope: "tasks" | "assets", id: string, intelligenceId: number) =>
     get<TaskIntelligence>(`/${scope}/${id}/intelligence/${intelligenceId}`),
   updateIntelligence: (taskId: number, intelligenceId: number, status: string) =>
@@ -994,6 +1213,20 @@ export const api = {
   setBasicAuthSettings: (settings: { enabled: boolean; username: string; password: string }) =>
     put<{ enabled: boolean; username: string; password_set: boolean }>("/settings/basic-auth", settings),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
+
+  // ---- MCP 服务端（ARTEX 对外暴露的 /mcp）：开关、访问令牌、调用审计 ----
+  mcpServerSettings: () => get<McpServerSettings>("/mcp-server/settings"),
+  setMcpServerEnabled: (enabled: boolean) => put<McpServerSettings>("/mcp-server/settings", { enabled }),
+  setMcpServerAccess: (access: { allowed_ips: string[]; trusted_proxies: string[] }) =>
+    put<McpServerSettings>("/mcp-server/settings", access),
+  mcpServerTokens: () => get<{ tokens: McpServerToken[] }>("/mcp-server/tokens").then((r) => arr(r.tokens)),
+  // 明文令牌只在创建响应里返回这一次。
+  createMcpServerToken: (input: McpServerTokenInput) =>
+    post<{ token: string; item: McpServerToken }>("/mcp-server/tokens", input),
+  revokeMcpServerToken: (id: number) => post<{ ok: boolean }>(`/mcp-server/tokens/${id}/revoke`),
+  deleteMcpServerToken: (id: number) => del<{ ok: boolean }>(`/mcp-server/tokens/${id}`),
+  mcpServerAudit: (limit = 50) =>
+    get<{ entries: McpServerAuditEntry[] }>(`/mcp-server/audit?limit=${limit}`).then((r) => arr(r.entries)),
   // Run a real "test" search with the given (or saved) config to verify it works.
   testWebSearch: (patch: {
     web_search_backend?: string;
@@ -1040,7 +1273,15 @@ export const api = {
   // ---- 漏洞 IM 推送 ----
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
-  notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
+  notifyMeta: () =>
+    get<NotificationMeta>(`/notify/meta`).then((meta) => {
+      // An empty demo/proxy response must enter the page's load-error path,
+      // rather than crash the render when it reads kinds.find or stats.
+      if (!meta || !Array.isArray(meta.kinds) || !meta.stats || !meta.defaults) {
+        throw new Error("通知配置响应不完整，请刷新后重试");
+      }
+      return meta;
+    }),
   notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
@@ -1081,7 +1322,7 @@ export const api = {
   report: async (task?: string) => {
     if (MOCK) return mockReport(task);
     const token = getToken();
-    const r = await fetch(`/api/report${tq(task)}`, {
+    const r = await apiFetch(`/api/report${tq(task)}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (!r.ok) throw new Error(`report: ${r.status}`);
@@ -1109,7 +1350,7 @@ export const api = {
     const fd = new FormData();
     for (const f of files) fd.append("file", f);
     const token = getToken();
-    const r = await fetch(`/api/chat/upload?scope=${scope}&id=${encodeURIComponent(id)}`, {
+    const r = await apiFetch(`/api/chat/upload?scope=${scope}&id=${encodeURIComponent(id)}`, {
       method: "POST",
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
@@ -1369,7 +1610,7 @@ export const api = {
     const fd = new FormData();
     fd.append("file", file);
     const token = getToken();
-    const r = await fetch(`/api/skills/upload${overwrite ? "?overwrite=true" : ""}`, {
+    const r = await apiFetch(`/api/skills/upload${overwrite ? "?overwrite=true" : ""}`, {
       method: "POST",
       body: fd,
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -1458,7 +1699,7 @@ export const api = {
   interceptGetToolConfig: async (): Promise<{ enabled_tools: string[] }> => {
     if (MOCK) return { enabled_tools: ["bash"] };
     const token = getToken();
-    const r = await fetch("/api/intercept/tool-config", {
+    const r = await apiFetch("/api/intercept/tool-config", {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (!r.ok) throw new Error(await r.text());
@@ -1467,7 +1708,7 @@ export const api = {
   interceptSetToolConfig: async (enabledTools: string[]): Promise<void> => {
     if (MOCK) return;
     const token = getToken();
-    const r = await fetch("/api/intercept/tool-config", {
+    const r = await apiFetch("/api/intercept/tool-config", {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",

@@ -21,10 +21,13 @@ export function parseWorkerCountInput(value: string): number | null {
 }
 
 export interface Task {
+  numeric_id?: number; // Underlying numeric identity when demo route IDs use aliases.
   distinct_findings?: FindingDistinctStats;
   id: string;
   remark?: string;
   worker_count?: number; // 本任务 Worker 数;0/缺省=用全局默认
+  worker_actual_count?: number; // 当前存活的 Worker pool loops，含缩容退出中的 loops
+  worker_target_count?: number; // 当前期望的 Worker slots 数量
   name?: string; // 可选任务名称;空/缺省=未命名,展示时回退到描述
   category_id?: number;
   category_name?: string;
@@ -33,6 +36,10 @@ export interface Task {
   description: string;
   goal: string;
   status: TaskStatus;
+  no_result_seconds?: number;
+  no_result_min_findings?: number;
+  no_result_min_severity?: "" | "low" | "medium" | "high" | "critical";
+  stop_reason?: string;
   created_at: string;
   created_unix?: number;
   completed_at?: string; // RFC3339 finish time (done/failed); "" if unfinished
@@ -556,6 +563,7 @@ export interface FindingGroup {
   task_name?: string; // 可选任务名称;空/缺省=未命名
   task_description: string;
   task_status: string;
+  task_stop_reason?: string;
   count: number;
   critical: number;
   high: number;
@@ -1022,7 +1030,7 @@ export interface Settings {
   show_egress_ip?: boolean; // 在顶栏显示直连 / 全局代理出口 IP；默认关闭
   egress_probe_url?: string; // 自定义 IP 探测服务；空=默认公共回显服务
   python_interpreter?: string; // 自定义脚本工具的 python 解释器路径(空=运行时检测)
-  workers?: number; // 并发工作 agent 数(默认3)；对之后启动的任务生效
+  workers?: number; // 并发工作 agent 数(默认3)；热更新跟随全局配置的任务
   worker_pools: WorkerPool[];
   // 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
   task_concurrency_enabled?: boolean; // 默认 false
@@ -1059,7 +1067,12 @@ export interface ProxyPoolEntry {
   health: "healthy" | "unhealthy-cooling" | "disabled" | string;
 }
 
-export interface ProxySwitchLog { at: string; from: string; to: string; reason: string }
+export interface ProxySwitchLog {
+  at: string;
+  from: string;
+  to: string;
+  reason: string;
+}
 
 export interface WorkerPool {
   profile_id: string;
@@ -1143,7 +1156,7 @@ export interface NotificationDelivery {
 export interface LLMProfile {
   id: string;
   name: string;
-  format: "openai" | "anthropic" | "openai-responses" | "jev";
+  format: "openai" | "anthropic" | "openai-responses" | "gemini" | "jev";
   base_url?: string;
   proxy?: string;
   model: string;
@@ -1956,6 +1969,7 @@ export interface EgressCheck {
   path?: string;
   skipped?: boolean;
   skip_reason?: string;
+  skip_code?: string;
   result: EgressProbeResult;
 }
 
@@ -1967,4 +1981,21 @@ export interface EgressReport {
   agent_proxy: string;
   checks: EgressCheck[];
   warnings?: string[];
+  warning_details?: { code: string; params?: Record<string, unknown>; message: string }[];
+}
+
+// Task-relative, read-only file browser.
+export interface TaskFileEntry extends WorkspaceEntry {
+  symlink: boolean;
+  intent_id?: number;
+  intent_title?: string;
+  intent_state?: string;
+}
+export interface TaskFileListing {
+  path: string;
+  entries: TaskFileEntry[];
+  total: number;
+  size: number;
+  truncated: boolean;
+  missing: boolean;
 }

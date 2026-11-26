@@ -378,6 +378,14 @@ func (t *Traffic) CACertPath() string {
 	return filepath.Join(t.dir, "_ca", "mitmproxy-ca-cert.pem")
 }
 
+// SnapshotIndex writes a transactionally consistent copy of the live SQLite
+// index to dest (which must not exist). Copying index.sqlite directly would miss
+// pages still in the WAL and could capture a half-applied write.
+func (t *Traffic) SnapshotIndex(dest string) error {
+	_, err := t.db.Exec(`VACUUM INTO ?`, dest)
+	return err
+}
+
 // Start runs the proxy (blocking); run in a goroutine.
 func (t *Traffic) Start() error { return t.proxy.Start() }
 
@@ -410,6 +418,20 @@ func (t *Traffic) DB() *sql.DB { return t.db }
 type sink struct {
 	mproxy.BaseAddon
 	t *Traffic
+}
+
+// Preserve an absent User-Agent when go-mitmproxy creates its outbound Go
+// request. An explicit empty value suppresses net/http's automatic default.
+func (s *sink) Requestheaders(f *mproxy.Flow) {
+	if f.Request == nil {
+		return
+	}
+	if f.Request.Header == nil {
+		f.Request.Header = make(http.Header)
+	}
+	if _, present := f.Request.Header["User-Agent"]; !present {
+		f.Request.Header.Set("User-Agent", "")
+	}
 }
 
 func (s *sink) Response(f *mproxy.Flow) {
@@ -683,6 +705,9 @@ func headerLines(h map[string][]string) string {
 func requestHeaderLines(req *mproxy.Request) string {
 	headers := req.Header.Clone()
 	headers.Del("Host")
+	if headers.Get("User-Agent") == "" {
+		headers.Del("User-Agent") // Empty suppression value is not sent on the wire.
+	}
 	host := req.URL.Host
 	if raw := req.Raw(); raw != nil && strings.TrimSpace(raw.Host) != "" {
 		host = raw.Host

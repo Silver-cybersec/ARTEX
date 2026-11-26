@@ -53,6 +53,12 @@ type Server struct {
 	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
 	basicAuth basicAuthGate
 
+	// mcpStoreOverride replaces the PostgreSQL-backed MCP server store in tests.
+	mcpStoreOverride mcpStore
+	// mcpCreateMu serializes MCP task creation so a token's quota check and the
+	// creation it guards cannot interleave with another request on the same token.
+	mcpCreateMu sync.Mutex
+
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
 	// free slots off the same snapshot and over-promote past the limit.
@@ -417,7 +423,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 		return db.ErrJevProfileJudgeOnly
 	}
 	// cfg.Provider() returns one of the chat format strings
-	// (anthropic / openai / openai-responses), matching the DB CHECK constraint;
+	// (anthropic / openai / openai-responses / gemini), matching the DB CHECK constraint;
 	// Jev is intentionally handled by the dedicated intercept path.
 	format := cfg.Provider()
 	var id int64
@@ -819,6 +825,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/update/rollback", s.updateRollback)
 	mux.HandleFunc("GET /api/update/stream", s.updateStream)
 
+	// 一键备份 / 恢复（迁移数据）。恢复会替换全部数据并重启，同样只对已登录管理员开放。
+	mux.HandleFunc("GET /api/system/backup/status", s.backupStatus)
+	mux.HandleFunc("GET /api/system/backup/export", s.backupExport)
+	mux.HandleFunc("POST /api/system/backup/restore", s.backupRestore)
+
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
 	mux.HandleFunc("GET /api/schedules", s.listSchedules)
@@ -873,6 +884,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/intent-assets", s.taskIntentAssets)
 
 	// 工作空间文件管理器（针对 workDir）
+	mux.HandleFunc("GET /api/tasks/{id}/files", s.taskFilesList)
+	mux.HandleFunc("GET /api/tasks/{id}/files/all", s.taskFilesAll)
+	mux.HandleFunc("GET /api/tasks/{id}/files/read", s.taskFilesServe)
+	mux.HandleFunc("GET /api/tasks/{id}/files/download", s.taskFilesServe)
+	mux.HandleFunc("GET /api/tasks/{id}/files/preview", s.taskFilesServe)
+	mux.HandleFunc("GET /api/tasks/{id}/files/archive", s.taskFilesArchive)
 	mux.HandleFunc("GET /api/workspace/list", s.wsList)
 	mux.HandleFunc("GET /api/workspace/read", s.wsRead)
 	mux.HandleFunc("POST /api/workspace/write", s.wsWrite)
@@ -921,6 +938,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/exploration/frontier", s.frontier)
 	mux.HandleFunc("GET /api/exploration/findings", s.findings)
+	mux.HandleFunc("DELETE /api/exploration/findings", s.deleteFindings)
 	mux.HandleFunc("GET /api/exploration/findings/groups", s.findingGroups)
 	mux.HandleFunc("GET /api/exploration/finding-cases", s.listFindingCases)
 	mux.HandleFunc("POST /api/exploration/finding-cases", s.mergeFindingCase)
@@ -1073,6 +1091,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mcp", s.pgSaveMCP)
 	mux.HandleFunc("DELETE /api/mcp/{id}", s.pgDeleteMCP)
 	mux.HandleFunc("GET /api/mcp/{id}/tools", s.pgMCPTools)
+	// MCP 服务端(ARTEX 对外暴露的 /mcp)：开关、访问令牌、调用审计
+	mux.HandleFunc("GET /api/mcp-server/settings", s.getMCPServerSettings)
+	mux.HandleFunc("PUT /api/mcp-server/settings", s.putMCPServerSettings)
+	mux.HandleFunc("GET /api/mcp-server/tokens", s.listMCPServerTokens)
+	mux.HandleFunc("POST /api/mcp-server/tokens", s.createMCPServerToken)
+	mux.HandleFunc("POST /api/mcp-server/tokens/{id}/revoke", s.revokeMCPServerToken)
+	mux.HandleFunc("DELETE /api/mcp-server/tokens/{id}", s.deleteMCPServerToken)
+	mux.HandleFunc("GET /api/mcp-server/audit", s.listMCPServerAudit)
 	mux.HandleFunc("POST /api/mcp/{id}/refresh", s.pgRefreshMCP)
 	// 资产同步 — ScopeSentry 数据源
 	mux.HandleFunc("GET /api/sync/scopesentry/status", s.syncSSStatus)
@@ -1145,7 +1171,13 @@ func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
-	return s.requireBasicAuth(root)
+	// /mcp sits outside the Basic Auth gate on purpose: an external MCP client has
+	// one Authorization header and it carries the access token, so it could never
+	// satisfy both. The endpoint authenticates with access tokens only.
+	top := http.NewServeMux()
+	top.HandleFunc(mcpEndpointPath, s.serveMCP)
+	top.Handle("/", s.requireBasicAuth(root))
+	return top
 }
 
 // --- handlers ---
@@ -1259,6 +1291,7 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
 		dto := taskDTO(t, s.resolvedTaskStatus(t))
+		dto.WorkerActualCount, dto.WorkerTargetCount = s.engine.WorkerCounts(t)
 		applyTaskArchiveBlocker(&dto, archiveBlockers)
 		metric := metrics[t.ExpID]
 		dto.Tokens = tokenTotalDTO(metric.Tokens)
@@ -1288,6 +1321,10 @@ func (s *Server) resolvedTaskStatus(t *Task) string {
 		return "created"
 	}
 	lifecycle := t.lifecycleSnapshot()
+	return s.resolvedTaskStatusFromSnapshot(t, lifecycle)
+}
+
+func (s *Server) resolvedTaskStatusFromSnapshot(t *Task, lifecycle taskLifecycleState) string {
 	switch {
 	case isTerminalStatus(lifecycle.Status):
 		return lifecycle.Status
@@ -1703,10 +1740,13 @@ type createTaskReq struct {
 	CategoryID           *int64           `json:"category_id,omitempty"`
 	Description          string           `json:"description"`
 	Goal                 string           `json:"goal"`
-	LLMProfileID         *int64           `json:"llm_profile_id,omitempty"`    // 指定运行本任务的 LLM 配置;省略/null=用激活配置
-	LLMProfileIDs        []int64          `json:"llm_profile_ids,omitempty"`   // 有序任务级配置链;第一项初始生效
-	SourceTaskIDs        []string         `json:"source_task_ids,omitempty"`   // 仅直接、只读继承的来源任务
-	CompanyIDs           []int64          `json:"company_ids,omitempty"`       // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
+	LLMProfileID         *int64           `json:"llm_profile_id,omitempty"`  // 指定运行本任务的 LLM 配置;省略/null=用激活配置
+	LLMProfileIDs        []int64          `json:"llm_profile_ids,omitempty"` // 有序任务级配置链;第一项初始生效
+	SourceTaskIDs        []string         `json:"source_task_ids,omitempty"` // 仅直接、只读继承的来源任务
+	CompanyIDs           []int64          `json:"company_ids,omitempty"`     // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
+	NoResultSeconds      int              `json:"no_result_seconds"`
+	NoResultMinFindings  int              `json:"no_result_min_findings"`
+	NoResultMinSeverity  string           `json:"no_result_min_severity"`
 	TimeoutSeconds       int              `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
 	PlanHeartbeatSeconds int              `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
 	SeedFirstIntent      *bool            `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
@@ -1718,12 +1758,31 @@ type createTaskReq struct {
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 }
 
+// taskCreateError is a rejected task creation: an HTTP-style status plus a
+// message that is safe to show to the caller.
+type taskCreateError struct {
+	Status int
+	Msg    string
+}
+
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	var req createTaskReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
+	t, cerr := s.createTaskFromRequest(req)
+	if cerr != nil {
+		writeErr(w, cerr.Status, cerr.Msg)
+		return
+	}
+	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
+}
+
+// createTaskFromRequest validates a creation request, stores the task and
+// launches it. It is the single creation path shared by POST /api/tasks and the
+// MCP spawn_task tool, so both apply identical validation.
+func (s *Server) createTaskFromRequest(req createTaskReq) (*Task, *taskCreateError) {
 	if strings.TrimSpace(req.Description) == "" {
 		req.Description = "未命名任务"
 	}
@@ -1731,69 +1790,63 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		req.LLMProfileIDs = []int64{*req.LLMProfileID}
 	}
 	if err := s.validateTaskProfileIDs(req.LLMProfileIDs); err != nil {
-		writeErr(w, 400, err.Error())
-		return
+		return nil, &taskCreateError{400, err.Error()}
+	}
+	if err := db.NormalizeNoResultOptions(&db.TaskCreateOptions{NoResultSeconds: req.NoResultSeconds, NoResultMinFindings: req.NoResultMinFindings, NoResultMinSeverity: req.NoResultMinSeverity}); err != nil {
+		return nil, &taskCreateError{400, err.Error()}
 	}
 	if req.TimeoutSeconds < 0 {
 		req.TimeoutSeconds = 0
 	}
 	if len(req.SourceTaskIDs) > db.MaxTaskSourceCount {
-		writeErr(w, 400, fmt.Sprintf("关联任务最多选择 %d 个", db.MaxTaskSourceCount))
-		return
+		return nil, &taskCreateError{400, fmt.Sprintf("关联任务最多选择 %d 个", db.MaxTaskSourceCount)}
 	}
 	sourceIDs := make([]int64, 0, len(req.SourceTaskIDs))
 	seenSources := map[int64]bool{}
 	for _, raw := range req.SourceTaskIDs {
 		id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 		if err != nil || id <= 0 || seenSources[id] {
-			writeErr(w, 400, "关联任务 id 无效或重复")
-			return
+			return nil, &taskCreateError{400, "关联任务 id 无效或重复"}
 		}
 		if _, ok := s.m.Task(strconv.FormatInt(id, 10)); !ok {
-			writeErr(w, 400, fmt.Sprintf("关联任务 #%d 不存在", id))
-			return
+			return nil, &taskCreateError{400, fmt.Sprintf("关联任务 #%d 不存在", id)}
 		}
 		seenSources[id] = true
 		sourceIDs = append(sourceIDs, id)
 	}
 	companyIDs, err := db.NormalizeTaskCompanyIDs(req.CompanyIDs)
 	if err != nil {
-		writeErr(w, 400, fmt.Sprintf("关联企业无效：最多选择 %d 个有效企业", db.MaxTaskCompanyCount))
-		return
+		return nil, &taskCreateError{400, fmt.Sprintf("关联企业无效：最多选择 %d 个有效企业", db.MaxTaskCompanyCount)}
 	}
 	req.CompanyIDs = companyIDs
 	interceptRules, err := buildTaskInterceptRules(req.InterceptRules)
 	if err != nil {
-		writeErr(w, 400, "任务级拦截规则无效："+err.Error())
-		return
+		return nil, &taskCreateError{400, "任务级拦截规则无效：" + err.Error()}
 	}
 	var schedule *db.TaskScheduleInput
 	if req.Schedule != nil {
 		input := s.scheduleInput(*req.Schedule, nil)
 		input.TaskIDs = nil
 		if err := db.ValidateTaskScheduleInput(input); err != nil {
-			writeErr(w, 400, err.Error())
-			return
+			return nil, &taskCreateError{400, err.Error()}
 		}
 		schedule = &input
 	}
 	remark, err := normalizeRemark(req.Remark)
 	if err != nil {
-		writeErr(w, 400, err.Error())
-		return
+		return nil, &taskCreateError{400, err.Error()}
 	}
 	if req.WorkerCount < 0 {
-		writeErr(w, 400, "Worker 运行数量不能为负数")
-		return
+		return nil, &taskCreateError{400, "Worker 运行数量不能为负数"}
 	}
 	if req.WorkerCount > db.MaxTaskWorkerCount {
-		writeErr(w, 400, fmt.Sprintf("Worker 运行数量最多 %d", db.MaxTaskWorkerCount))
-		return
+		return nil, &taskCreateError{400, fmt.Sprintf("Worker 运行数量最多 %d", db.MaxTaskWorkerCount)}
 	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
 		Schedule: schedule,
 		Name:     strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
+		NoResultSeconds: req.NoResultSeconds, NoResultMinFindings: req.NoResultMinFindings, NoResultMinSeverity: req.NoResultMinSeverity,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
 		CoverageEnabled:   req.CoverageEnabled,
 		ShareGlobalAssets: req.ShareGlobalAssets,
@@ -1803,15 +1856,12 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
-			writeErr(w, 400, "任务分类不存在或无效")
-			return
+			return nil, &taskCreateError{400, "任务分类不存在或无效"}
 		}
 		if errors.Is(err, db.ErrTaskCompanyIDsInvalid) || errors.Is(err, db.ErrTaskCompanyNotFound) {
-			writeErr(w, 400, "关联企业不存在或无效")
-			return
+			return nil, &taskCreateError{400, "关联企业不存在或无效"}
 		}
-		writeErr(w, 500, err.Error())
-		return
+		return nil, &taskCreateError{500, err.Error()}
 	}
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
@@ -1821,7 +1871,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	} else {
 		s.engine.Pause(t.ID, agent.AbortPausedBySchedule)
 	}
-	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
+	return t, nil
 }
 
 func (s *Server) validateTaskProfileIDs(ids []int64) error {
@@ -2025,6 +2075,7 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := taskDTO(t, s.resolvedTaskStatus(t))
+	dto.WorkerActualCount, dto.WorkerTargetCount = s.engine.WorkerCounts(t)
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
 	writeJSON(w, 200, dto)
@@ -2681,6 +2732,123 @@ func (s *Server) deleteFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"deleted": true, "id": id})
+}
+
+// deleteFindings bulk-deletes findings according to scope:
+//   - scope="all": delete all findings
+//   - scope="filtered": delete findings matching the shared FindingFilter fields
+//   - scope="selected": delete findings listed in ids (required, positive int64)
+//
+// Accepts a JSON body (preferred for large id lists) or query parameters.
+func (s *Server) deleteFindings(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Scope   string            `json:"scope"`
+		IDs     []json.RawMessage `json:"ids"`
+		Filters *struct {
+			Severity   string `json:"severity"`
+			Status     string `json:"status"`
+			VulnClass  string `json:"vulnclass"`
+			TaskID     string `json:"task_id"`
+			Query      string `json:"q"`
+			From       string `json:"from"`
+			To         string `json:"to"`
+			AssetScope string `json:"asset_scope"`
+		} `json:"filters"`
+	}
+	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeErr(w, 400, "invalid body")
+			return
+		}
+	}
+
+	q := r.URL.Query()
+	scope := strings.TrimSpace(req.Scope)
+	if scope == "" {
+		scope = strings.TrimSpace(q.Get("scope"))
+	}
+
+	var (
+		ids    []int64
+		filter db.FindingFilter
+	)
+	switch scope {
+	case "selected":
+		if len(req.IDs) > 0 {
+			for _, raw := range req.IDs {
+				var (
+					id  int64
+					str string
+				)
+				if err := json.Unmarshal(raw, &id); err != nil {
+					if err2 := json.Unmarshal(raw, &str); err2 != nil {
+						writeErr(w, 400, "bad finding id")
+						return
+					}
+					parsed, err2 := strconv.ParseInt(strings.TrimSpace(str), 10, 64)
+					if err2 != nil {
+						writeErr(w, 400, "bad finding id: "+str)
+						return
+					}
+					id = parsed
+				}
+				if id <= 0 {
+					writeErr(w, 400, "bad finding id")
+					return
+				}
+				ids = append(ids, id)
+			}
+		} else {
+			for _, part := range strings.Split(q.Get("ids"), ",") {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				id, err := strconv.ParseInt(part, 10, 64)
+				if err != nil || id <= 0 {
+					writeErr(w, 400, "bad finding id: "+part)
+					return
+				}
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) == 0 {
+			writeErr(w, 400, "no findings selected")
+			return
+		}
+	case "all":
+		// Empty filter deletes every finding in the standalone findings table.
+	case "filtered":
+		if req.Filters != nil {
+			filter = db.FindingFilter{
+				Severity:   normFilter(req.Filters.Severity),
+				Status:     normFilter(req.Filters.Status),
+				VulnClass:  normFilter(req.Filters.VulnClass),
+				TaskID:     normFilter(req.Filters.TaskID),
+				Query:      req.Filters.Query,
+				From:       strings.TrimSpace(req.Filters.From),
+				To:         strings.TrimSpace(req.Filters.To),
+				AssetScope: strings.TrimSpace(req.Filters.AssetScope),
+			}
+		} else {
+			filter = findingFilterFromQuery(q)
+		}
+	default:
+		writeErr(w, 400, "bad scope: "+scope)
+		return
+	}
+
+	n, err := s.m.pg.DeleteFindings(r.Context(), filter, ids)
+	if err != nil {
+		if errors.Is(err, db.ErrTaskArchiveState) {
+			writeErr(w, 409, err.Error())
+			return
+		}
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"deleted": n})
 }
 
 func (s *Server) intents(w http.ResponseWriter, r *http.Request) {
@@ -3697,7 +3865,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"show_egress_ip":                      s.m.pg.GetBool(settingShowEgressIP, false),
 		"egress_probe_url":                    s.m.EgressProbeURL(),
 		"python_interpreter":                  strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
-		"workers":                             s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		"workers":                             s.m.Workers(),               // 并发工作 agent 数(默认3)；实时更新使用全局默认的任务
 		"worker_pools":                        s.m.WorkerPools(),           // 非空时按池顺序绑定 worker 会话
 		"task_concurrency_enabled":            concOn,                      // 任务并发上限开关(默认关)
 		"task_concurrency_limit":              concLimit,                   // 同时运行任务上限(开启后默认5)
@@ -3790,7 +3958,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		ShowEgressIP           *bool         `json:"show_egress_ip"`     // 在顶栏显示直连/全局代理出口 IP；默认关
 		EgressProbeURL         *string       `json:"egress_probe_url"`   // null=不改；空串=默认公共探测服务
 		PythonInterp           *string       `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
-		Workers                *int          `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
+		Workers                *int          `json:"workers"`            // 并发工作 agent 数(1..50)；实时更新使用全局默认的任务
 		WorkerPools            *[]WorkerPool `json:"worker_pools"`
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
@@ -3880,10 +4048,6 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	// synchronizes workers to its total. An empty list clears pools; when workers
 	// is also present it sets the legacy count for the newly restored legacy mode.
 	if req.WorkerPools != nil {
-		if len(*req.WorkerPools) == 0 && req.Workers != nil && *req.Workers <= 0 {
-			writeErr(w, 400, "workers 必须 >0")
-			return
-		}
 		legacyWorkers := []int(nil)
 		if req.Workers != nil {
 			legacyWorkers = []int{*req.Workers}

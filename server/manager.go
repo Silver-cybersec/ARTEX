@@ -64,7 +64,13 @@ type Task struct {
 	SourceTaskIDs      []int64 `json:"source_task_ids,omitempty"`
 	CompanyIDs         []int64 `json:"company_ids,omitempty"`
 	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
-	// 任务级超时(见 docs/任务级超时与收尾设计.md)。DeadlineAt/FirstRunAt 为 unix 秒,0=未设/未运行。
+	// No-result options are immutable. Mutable checkpoint fields use lifecycleMu.
+	NoResultSeconds      int                    `json:"no_result_seconds"`
+	NoResultMinFindings  int                    `json:"no_result_min_findings"`
+	NoResultMinSeverity  string                 `json:"no_result_min_severity"`
+	NoResultBaseSeconds  int64                  `json:"no_result_base_seconds"`
+	NoResultCheckedAt    int64                  `json:"no_result_checked_at,omitempty"`
+	StopReason           string                 `json:"stop_reason"`
 	TimeoutSeconds       int                    `json:"timeout_seconds"`
 	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
 	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
@@ -93,6 +99,7 @@ type Task struct {
 // directly after the task has been published by Manager.
 type taskLifecycleState struct {
 	ShareGlobalAssets   bool
+	WorkerCount         int
 	Name                string
 	Remark              string
 	PinnedAt            int64
@@ -111,6 +118,9 @@ type taskLifecycleState struct {
 	CompletedAt         int64
 	FirstRunAt          int64
 	DeadlineAt          int64
+	NoResultBaseSeconds int64
+	NoResultCheckedAt   int64
+	StopReason          string
 	ActiveRunSeconds    int64
 	RunSegmentStartedAt int64
 	SourceTaskIDs       []int64
@@ -131,6 +141,7 @@ func (t *Task) lifecycleSnapshot() taskLifecycleState {
 func (t *Task) lifecycleSnapshotLocked() taskLifecycleState {
 	return taskLifecycleState{
 		ShareGlobalAssets: t.ShareGlobalAssets,
+		WorkerCount:       t.WorkerCount,
 		Name:              t.Name,
 		Remark:            t.Remark,
 		PinnedAt:          t.PinnedAt,
@@ -144,6 +155,7 @@ func (t *Task) lifecycleSnapshotLocked() taskLifecycleState {
 		CompletedAt:         t.CompletedAt,
 		FirstRunAt:          t.FirstRunAt,
 		DeadlineAt:          t.DeadlineAt,
+		NoResultBaseSeconds: t.NoResultBaseSeconds, NoResultCheckedAt: t.NoResultCheckedAt, StopReason: t.StopReason,
 		ActiveRunSeconds:    t.ActiveRunSeconds,
 		RunSegmentStartedAt: t.RunSegmentStartedAt,
 		SourceTaskIDs:       append([]int64(nil), t.SourceTaskIDs...),
@@ -161,6 +173,7 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	state := t.lifecycleSnapshotLocked()
 	update(&state)
 	t.ShareGlobalAssets = state.ShareGlobalAssets
+	t.WorkerCount = state.WorkerCount
 	t.Name = state.Name
 	t.Remark = state.Remark
 	t.PinnedAt = state.PinnedAt
@@ -179,6 +192,9 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	t.CompletedAt = state.CompletedAt
 	t.FirstRunAt = state.FirstRunAt
 	t.DeadlineAt = state.DeadlineAt
+	t.NoResultBaseSeconds = state.NoResultBaseSeconds
+	t.NoResultCheckedAt = state.NoResultCheckedAt
+	t.StopReason = state.StopReason
 	t.ActiveRunSeconds = state.ActiveRunSeconds
 	t.RunSegmentStartedAt = state.RunSegmentStartedAt
 	t.SourceTaskIDs = append(t.SourceTaskIDs[:0], state.SourceTaskIDs...)
@@ -269,13 +285,14 @@ type Manager struct {
 	// taskStateMu preserves commit order between PostgreSQL lifecycle writes and
 	// their in-memory mirrors. lifecycleMu makes snapshots race-free, but without
 	// this outer write lock an older request could commit first and publish last.
-	taskStateMu sync.Mutex
-	controlMu   *sync.Mutex // Server's admission/task-control mutex, when attached.
-	mu          sync.RWMutex
-	tasks       map[string]*Task
-	active      string
-	trafficOn   bool // 流量捕获开关（默认关；settings.traffic_capture）
-	llmRecOn    bool // LLM 录制开关（默认关；settings.llm_record）
+	taskStateMu         sync.Mutex
+	controlMu           *sync.Mutex // Server's admission/task-control mutex, when attached.
+	mu                  sync.RWMutex
+	tasks               map[string]*Task
+	workerConfigChanged func()
+	active              string
+	trafficOn           bool // 流量捕获开关（默认关；settings.traffic_capture）
+	llmRecOn            bool // LLM 录制开关（默认关；settings.llm_record）
 	// 联网搜索开关与来源（默认关；settings.web_search_*）。brave-free 需要 braveKey；tavily 需要 tavilyKey。
 	// webSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关。
 	webSearchOn      bool
@@ -296,6 +313,23 @@ type Manager struct {
 // SetTaskControlMutex lets lifecycle operations that originate in Manager
 // participate in the Server's admission/task-control critical section.
 func (m *Manager) SetTaskControlMutex(mu *sync.Mutex) { m.controlMu = mu }
+
+// SetWorkerConfigChangedCallback installs the engine's live worker reconciler.
+// Successful worker-setting writes invoke it after releasing Manager locks.
+func (m *Manager) SetWorkerConfigChangedCallback(callback func()) {
+	m.mu.Lock()
+	m.workerConfigChanged = callback
+	m.mu.Unlock()
+}
+
+func (m *Manager) notifyWorkerConfigChanged() {
+	m.mu.RLock()
+	callback := m.workerConfigChanged
+	m.mu.RUnlock()
+	if callback != nil {
+		callback()
+	}
+}
 
 // Settings keys the UI toggles at runtime.
 const (
@@ -420,6 +454,9 @@ func ExpandWorkerSlots(pools []WorkerPool, legacy int) ([]WorkerSlot, error) {
 		if legacy <= 0 {
 			legacy = defaultWorkers
 		}
+		if legacy > pgdb.MaxTaskWorkerCount {
+			legacy = pgdb.MaxTaskWorkerCount
+		}
 		slots := make([]WorkerSlot, legacy)
 		for i := range slots {
 			slots[i] = WorkerSlot{Name: fmt.Sprintf("work#%d", i+1)}
@@ -465,8 +502,8 @@ func (m *Manager) SetConcurrency(enabled bool, limit int) error {
 	return m.pg.SetSetting(settingConcurrencyOn, strconv.FormatBool(enabled))
 }
 
-// Workers returns the configured concurrent work-agent count (default 3). Read
-// per-task at engine.Run, so a change applies to tasks started afterwards.
+// Workers returns the configured concurrent work-agent count (default 3),
+// capped at the supported maximum even for settings saved by older versions.
 func (m *Manager) Workers() int {
 	v, ok, err := m.pg.GetSetting(settingWorkers)
 	if err != nil || !ok {
@@ -475,6 +512,9 @@ func (m *Manager) Workers() int {
 	n, err := strconv.Atoi(strings.TrimSpace(v))
 	if err != nil || n <= 0 {
 		return defaultWorkers
+	}
+	if n > pgdb.MaxTaskWorkerCount {
+		return pgdb.MaxTaskWorkerCount
 	}
 	return n
 }
@@ -529,23 +569,31 @@ func (m *Manager) SetWorkerPools(pools []WorkerPool, legacyWorkers ...int) error
 			workerCount += pool.Workers
 		}
 	} else if len(legacyWorkers) > 0 {
-		if legacyWorkers[0] <= 0 {
-			return fmt.Errorf("workers 必须 >0")
+		if legacyWorkers[0] <= 0 || legacyWorkers[0] > pgdb.MaxTaskWorkerCount {
+			return fmt.Errorf("workers 必须在 1 到 %d 之间", pgdb.MaxTaskWorkerCount)
 		}
 		workerCount = legacyWorkers[0]
 	}
-	return m.pg.SetSettingsAtomic(context.Background(), map[string]string{
+	if err := m.pg.SetSettingsAtomic(context.Background(), map[string]string{
 		settingWorkerPools: string(b),
 		settingWorkers:     strconv.Itoa(workerCount),
-	})
+	}); err != nil {
+		return err
+	}
+	m.notifyWorkerConfigChanged()
+	return nil
 }
 
-// SetWorkers persists the concurrent work-agent count. Values <=0 are rejected.
+// SetWorkers persists the concurrent work-agent count and reconciles live tasks.
 func (m *Manager) SetWorkers(n int) error {
-	if n <= 0 {
-		return fmt.Errorf("workers 必须 >0")
+	if n <= 0 || n > pgdb.MaxTaskWorkerCount {
+		return fmt.Errorf("workers 必须在 1 到 %d 之间", pgdb.MaxTaskWorkerCount)
 	}
-	return m.pg.SetSetting(settingWorkers, strconv.Itoa(n))
+	if err := m.pg.SetSetting(settingWorkers, strconv.Itoa(n)); err != nil {
+		return err
+	}
+	m.notifyWorkerConfigChanged()
+	return nil
 }
 
 // Enrich returns the asset auto-completion engine (may be nil if init failed).
@@ -1154,8 +1202,10 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		LLMProfileIDs: append([]int64(nil), pt.LLMProfileIDs...), ActiveLLMProfileID: pt.ActiveLLMProfileID,
 		LLMChainRevision: pt.LLMChainRevision,
 		LLMFailoverState: pt.LLMFailoverState, LLMFailoverReason: pt.LLMFailoverReason,
-		SourceTaskIDs:  append([]int64(nil), pt.SourceTaskIDs...),
-		CompanyIDs:     append([]int64(nil), pt.CompanyIDs...),
+		SourceTaskIDs:   append([]int64(nil), pt.SourceTaskIDs...),
+		CompanyIDs:      append([]int64(nil), pt.CompanyIDs...),
+		NoResultSeconds: pt.NoResultSeconds, NoResultMinFindings: pt.NoResultMinFindings, NoResultMinSeverity: pt.NoResultMinSeverity,
+		NoResultBaseSeconds: pt.NoResultBaseSeconds, NoResultCheckedAt: unixOrZero(pt.NoResultCheckedAt), StopReason: pt.StopReason,
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled, ShareGlobalAssets: pt.ShareGlobalAssets, WorkerCount: pt.WorkerCount,
 		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
@@ -1164,8 +1214,8 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 	}
 }
 
-// UpdateTaskMetadata changes task metadata and asset visibility without interrupting any
-// planner, main-agent, or worker call.
+// UpdateTaskMetadata changes task metadata, asset visibility, and worker policy
+// without interrupting any planner, main-agent, or worker call.
 func (m *Manager) UpdateTaskMetadata(taskID string, patch pgdb.TaskPatch) (*Task, error) {
 	m.taskStateMu.Lock()
 	defer m.taskStateMu.Unlock()
@@ -1185,6 +1235,7 @@ func (m *Manager) UpdateTaskMetadata(taskID string, patch pgdb.TaskPatch) (*Task
 	}
 	task.updateLifecycle(func(state *taskLifecycleState) {
 		state.ShareGlobalAssets = updated.ShareGlobalAssets
+		state.WorkerCount = updated.WorkerCount
 		state.Name = updated.Name
 		state.Remark = updated.Remark
 		state.PinnedAt = unixOrZero(updated.PinnedAt)
@@ -1490,7 +1541,9 @@ func (m *Manager) applyTaskAdmissionWithSchedule(id, expectedStatus, status stri
 		mode = ""
 	}
 
-	var queuedAt, completedAt, firstRunAt, deadlineAt, segmentStartedAt sql.NullTime
+	var queuedAt, completedAt, firstRunAt, deadlineAt, segmentStartedAt, noResultCheckedAt sql.NullTime
+	var noResultBaseSeconds int64
+	var stopReason string
 	var activeRunSeconds int64
 	var committedMode string
 	err = m.pg.QueryRow(`UPDATE tasks
@@ -1513,6 +1566,15 @@ func (m *Manager) applyTaskAdmissionWithSchedule(id, expectedStatus, status stri
 	        WHEN ($5 AND queued AND queue_mode='bootstrap') OR $4='bootstrap' THEN 'bootstrap'
 	        ELSE 'resume'
 	    END,
+	    no_result_base_seconds=CASE
+	        WHEN $6='timeout' AND stop_reason='no_result' AND $2 NOT IN ('done','failed','timeout') THEN active_run_seconds
+	        ELSE no_result_base_seconds
+	    END,
+	    no_result_checked_at=CASE
+	        WHEN $6='timeout' AND stop_reason='no_result' AND $2 NOT IN ('done','failed','timeout') THEN NULL
+	        ELSE no_result_checked_at
+	    END,
+	    stop_reason=CASE WHEN $6 IN ('done','failed','timeout') AND $2 NOT IN ('done','failed','timeout') THEN '' ELSE stop_reason END,
 	    first_run_at=CASE
 	        WHEN $6='timeout' AND $2 NOT IN ('done','failed','timeout') THEN NULL
 	        ELSE first_run_at
@@ -1524,8 +1586,8 @@ func (m *Manager) applyTaskAdmissionWithSchedule(id, expectedStatus, status stri
 	    ,active_run_seconds=active_run_seconds + CASE WHEN ($3 OR $2 IN ('done','failed','timeout')) AND run_segment_started_at IS NOT NULL THEN GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (now() - run_segment_started_at)))::bigint) ELSE 0 END
 	    ,run_segment_started_at=CASE WHEN $3 OR $2 IN ('done','failed','timeout') THEN NULL ELSE run_segment_started_at END
 	WHERE id=$1 AND deleted_at IS NULL AND status=$6
-	RETURNING queued_at, queue_mode, completed_at, first_run_at, deadline_at, active_run_seconds, run_segment_started_at`, n, status, queued, mode, preservePosition, expectedStatus, manualUntil, preserveSchedule).
-		Scan(&queuedAt, &committedMode, &completedAt, &firstRunAt, &deadlineAt, &activeRunSeconds, &segmentStartedAt)
+	RETURNING queued_at, queue_mode, completed_at, first_run_at, deadline_at, active_run_seconds, run_segment_started_at, no_result_base_seconds, no_result_checked_at, stop_reason`, n, status, queued, mode, preservePosition, expectedStatus, manualUntil, preserveSchedule).
+		Scan(&queuedAt, &committedMode, &completedAt, &firstRunAt, &deadlineAt, &activeRunSeconds, &segmentStartedAt, &noResultBaseSeconds, &noResultCheckedAt, &stopReason)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("task %s lifecycle changed before admission (expected status %q)", id, expectedStatus)
 	}
@@ -1557,6 +1619,12 @@ func (m *Manager) applyTaskAdmissionWithSchedule(id, expectedStatus, status stri
 			if deadlineAt.Valid {
 				state.DeadlineAt = deadlineAt.Time.Unix()
 			}
+			state.NoResultBaseSeconds = noResultBaseSeconds
+			state.NoResultCheckedAt = 0
+			if noResultCheckedAt.Valid {
+				state.NoResultCheckedAt = noResultCheckedAt.Time.Unix()
+			}
+			state.StopReason = stopReason
 			state.ActiveRunSeconds = activeRunSeconds
 			state.RunSegmentStartedAt = 0
 			if segmentStartedAt.Valid {
@@ -1846,6 +1914,9 @@ func (m *Manager) syncTaskRuntime(id string, n int64) error {
 	m.mu.Lock()
 	if t := m.tasks[id]; t != nil {
 		t.updateLifecycle(func(state *taskLifecycleState) {
+			state.NoResultBaseSeconds = pt.NoResultBaseSeconds
+			state.NoResultCheckedAt = unixOrZero(pt.NoResultCheckedAt)
+			state.StopReason = pt.StopReason
 			state.ActiveRunSeconds = pt.ActiveRunSeconds
 			state.RunSegmentStartedAt = unixOrZero(pt.RunSegmentStartedAt)
 		})
@@ -1930,13 +2001,21 @@ func (m *Manager) StampTaskFirstRun(id string) (int64, error) {
 // (resolves the completed↔timeout race — first terminal writer wins). Reflects the
 // won status on the live handle. won=false means another terminal already stuck.
 func (m *Manager) SetTaskStatusGuarded(id, status string) (won bool, err error) {
+	return m.SetTaskStatusGuardedReason(id, status, "")
+}
+
+func (m *Manager) SetTaskStatusGuardedReason(id, status, reason string) (won bool, err error) {
+	if status != "timeout" {
+		reason = ""
+	}
+
 	m.taskStateMu.Lock()
 	defer m.taskStateMu.Unlock()
 	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
 		return false, err
 	}
-	active, started, won, err := m.pg.SetTerminalStatusGuardedRuntime(n, status)
+	active, started, won, err := m.pg.SetTerminalStatusGuardedReasonRuntime(n, status, reason)
 	if err != nil || !won {
 		return won, err
 	}
@@ -1946,6 +2025,7 @@ func (m *Manager) SetTaskStatusGuarded(id, status string) (won bool, err error) 
 	if t := m.tasks[id]; t != nil {
 		t.updateLifecycle(func(state *taskLifecycleState) {
 			state.Status = status
+			state.StopReason = reason
 			state.ActiveRunSeconds = active
 			state.RunSegmentStartedAt = unixOrZero(started)
 			if pgdb.IsTerminal(status) {
@@ -1985,6 +2065,9 @@ func (m *Manager) SetTaskStatus(id, status string) error {
 	m.mu.Lock()
 	if t := m.tasks[id]; t != nil {
 		t.updateLifecycle(func(state *taskLifecycleState) {
+			if !pgdb.IsTerminal(status) && pgdb.IsTerminal(state.Status) {
+				state.StopReason = ""
+			}
 			state.Status = status
 			state.ActiveRunSeconds = active
 			state.RunSegmentStartedAt = unixOrZero(started)
